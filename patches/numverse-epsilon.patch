@@ -1,0 +1,4653 @@
+diff --git a/epsilon/Makefile b/epsilon/Makefile
+index 1d61e14f13..923207081d 100644
+--- a/epsilon/Makefile
++++ b/epsilon/Makefile
+@@ -2,7 +2,7 @@
+ 
+ PATH_haussmann := ../haussmann
+ APP_NAME := Epsilon
+-APP_VERSION := 26.1.0
++APP_VERSION := 26.4.0
+ OUTPUT_ROOT := output
+ DEBUG ?= 0
+ PLATFORM ?= host
+diff --git a/epsilon/apps/apps_container.cpp b/epsilon/apps/apps_container.cpp
+index c2fe7f4016..054701482e 100644
+--- a/epsilon/apps/apps_container.cpp
++++ b/epsilon/apps/apps_container.cpp
+@@ -235,15 +235,27 @@ void AppsContainer::switchToBuiltinApp(App::Snapshot* snapshot) {
+   if (activeApp() && snapshot != activeApp()->snapshot()) {
+     resetShiftAlphaStatus();
+   }
+-  if (snapshot == hardwareTestAppSnapshot() ||
++  bool hideTitleBar = snapshot == hardwareTestAppSnapshot() ||
+ #ifdef HARDWARE_CHECKUP
+-      snapshot == hardwareCheckupAppSnapshot() ||
++                      snapshot == hardwareCheckupAppSnapshot() ||
+ #endif
+-      snapshot == onBoardingAppSnapshot()) {
+-    m_window.hideTitleBarView(true);
+-  } else {
+-    m_window.hideTitleBarView(false);
+-  }
++                      snapshot == onBoardingAppSnapshot() ||
++                      snapshot == homeAppSnapshot();
++  if (hideTitleBar != m_window.titleBarViewIsHidden() && activeApp() &&
++      snapshot != activeApp()->snapshot()) {
++    /* NUMVERSE (from Windows-OS) fix for the Home / On-Off crash: showing or hiding the title
++     * bar relayouts the views of the app that is still active. When Home was
++     * pressed, the kernel jumped to the Home checkpoint and that app's views
++     * may hold layouts whose pool objects were rolled back: relayouting them
++     * dereferences dangling handles (a HardFault on the calculator, which then
++     * reboots on the official software). Leave the old app first. */
++    Container::switchToBuiltinApp(nullptr);
++  }
++  if (!activeApp()) {
++    // The window must not relayout the views of an app that is gone.
++    m_window.setContentView(nullptr);
++  }
++  m_window.hideTitleBarView(hideTitleBar);
+   if (snapshot) {
+     m_window.setTitle(snapshot->descriptor()->upperName());
+     GlobalContextAccessor::Store().prepareForNewApp();
+@@ -313,6 +325,16 @@ void AppsContainer::run() {
+   Ion::Events::setSpinner(true);
+   Ion::Display::setScreenshotCallback(ShowCursor);
+ 
++  /* NUMVERSE (from PSP-OS): this userland is started by the official one (slot A) through
++   * DFU. The kernel may still hold the checkpoints that the official userland
++   * set, and setCheckpoint ignores a checkpoint that is already set: Home (or
++   * waking up from On/Off) would then jump back into slot A's userland. Drop
++   * them so that our own Home checkpoint is the one the kernel uses. */
++  Ion::CircuitBreaker::unsetCheckpoint(
++      Ion::CircuitBreaker::CheckpointType::AnyKey);
++  Ion::CircuitBreaker::unsetCheckpoint(Ion::CircuitBreaker::CheckpointType::Back);
++  Ion::CircuitBreaker::unsetCheckpoint(Ion::CircuitBreaker::CheckpointType::Home);
++
+   /* Setup the home checkpoint so that the exception checkpoint will be
+    * reactivated on a home interrupt. This way, the main exception checkpoint
+    * will keep the home checkpoint as parent. */
+diff --git a/epsilon/apps/apps_window.h b/epsilon/apps/apps_window.h
+index a2b65e8c68..0ff5192f9e 100644
+--- a/epsilon/apps/apps_window.h
++++ b/epsilon/apps/apps_window.h
+@@ -16,6 +16,7 @@ class AppsWindow : public Escher::Window {
+   void reloadTitleBarView();
+   bool updateAlphaLock();
+   void hideTitleBarView(bool hide);
++  bool titleBarViewIsHidden() const { return m_hideTitleBarView; }
+   void updateBatteryAnimation();
+ 
+  private:
+diff --git a/epsilon/apps/home/Makefile b/epsilon/apps/home/Makefile
+index 938c4f9025..fb29936f4c 100644
+--- a/epsilon/apps/home/Makefile
++++ b/epsilon/apps/home/Makefile
+@@ -2,6 +2,9 @@ SOURCES_apps += $(addprefix $(PATH_apps)/home/,$(addsuffix :-test, \
+   app.cpp \
+   app_cell.cpp \
+   controller.cpp \
++  verse/engine.cpp \
++  verse/gfx.cpp \
++  verse/shell.cpp \
+ ))
+ 
+ SOURCES_apps += $(call generated_sources_for,$(addprefix $(PATH_apps)/home/, \
+diff --git a/epsilon/apps/home/app.h b/epsilon/apps/home/app.h
+index 97ab41c37b..bd97714b1a 100644
+--- a/epsilon/apps/home/app.h
++++ b/epsilon/apps/home/app.h
+@@ -3,6 +3,7 @@
+ #include <escher/app.h>
+ #include <escher/container.h>
+ #include <escher/selectable_table_view_data_source.h>
++#include <escher/timer.h>
+ 
+ #include "controller.h"
+ 
+@@ -28,6 +29,9 @@ class App : public Escher::App {
+   const Snapshot* snapshot() const {
+     return static_cast<const Snapshot*>(Escher::App::snapshot());
+   }
++  // NUMVERSE: the 3D world is animated by the run loop (see escher RunLoop)
++  int animationPeriod() override { return m_controller.framePeriod(); }
++  bool animationFrame() override { return m_controller.frame(); }
+ 
+  private:
+   App(Snapshot* snapshot);
+diff --git a/epsilon/apps/home/controller.cpp b/epsilon/apps/home/controller.cpp
+index 3b79f585f4..aefbc574bf 100644
+--- a/epsilon/apps/home/controller.cpp
++++ b/epsilon/apps/home/controller.cpp
+@@ -3,10 +3,11 @@
+ #include <apps/apps_container.h>
+ #include <apps/exam_mode_manager.h>
+ #include <apps/home/apps_layout.h>
+-#include <ion/keyboard/layout_events.h>
+-#include <poincare/preferences.h>
++#include <apps/i18n.h>
++#include <ion/timing.h>
+ 
+ #include "app.h"
++#include "verse/shell.h"
+ 
+ extern "C" {
+ #include <assert.h>
+@@ -17,189 +18,100 @@ using namespace Poincare;
+ 
+ namespace Home {
+ 
+-Controller::ContentView::ContentView(
+-    Controller* controller, SelectableTableViewDataSource* selectionDataSource)
+-    : m_selectableTableView(controller, controller, selectionDataSource,
+-                            controller) {
+-  m_selectableTableView.setVerticalCellOverlap(0);
+-  m_selectableTableView.setMargins(k_margins);
+-  m_selectableTableView.setBackgroundColor(ThemeComponent::DefaultBackground);
+-  m_selectableTableView.decorator()->setVerticalMargins(
+-      {k_indicatorMargin, k_indicatorMargin - k_bottomMargin});
+-}
+-
+-SelectableTableView* Controller::ContentView::selectableTableView() {
+-  return &m_selectableTableView;
+-}
++/* ------------------------------------------------------------------ view */
+ 
+-void Controller::ContentView::reloadBottomRow(
+-    SimpleTableViewDataSource* dataSource, int lastIconColumn) {
+-  /* We mark the missing icons on the last row as dirty. */
+-  for (int i = lastIconColumn + 1; i < dataSource->numberOfColumns(); i++) {
+-    markRectAsDirty(KDRect(dataSource->columnWidth(0) * i,
+-                           dataSource->rowHeight(0), dataSource->columnWidth(0),
+-                           dataSource->rowHeight(0)));
++void Controller::ContentView::drawRect(KDContext* ctx, KDRect rect) const {
++  uint64_t start = Ion::Timing::millis();
++  Verse::Band band;
++  for (KDCoordinate y = rect.top(); y <= rect.bottom();
++       y += Verse::Band::k_maxHeight) {
++    KDCoordinate h = rect.bottom() - y + 1;
++    if (h > Verse::Band::k_maxHeight) {
++      h = Verse::Band::k_maxHeight;
++    }
++    // Always whole rows: the world is drawn row by row
++    Verse::Rect area = {0, y, Verse::k_screenWidth, h};
++    band.begin(area);
++    Verse::Shell::render(band);
++    ctx->fillRectWithPixels(KDRect(area.x, area.y, area.w, area.h),
++                            band.pixels(), nullptr);
++  }
++  if (rect.height() >= Verse::k_screenHeight) {
++    Verse::Shell::setLastRedrawDuration(
++        static_cast<int>(Ion::Timing::millis() - start));
+   }
+ }
+ 
+-View* Controller::ContentView::subviewAtIndex(int index) {
+-  assert(index == 0);
+-  return &m_selectableTableView;
+-}
+-
+-void Controller::ContentView::layoutSubviews(bool force) {
+-  /* Selectable table view's bottom margin is used for vertical scroll: we
+-   * scroll to the selected cell's farthest pixel + bottom margin. For home app,
+-   * instead of having a bottom margin, we reduce the frame of the selectable
+-   * table view and ContentView::drawRect will take care of drawing the white
+-   * pixels at the bottom of the screen. */
+-  KDRect frame =
+-      KDRect(KDPointZero, bounds().width(), bounds().height() - k_bottomMargin);
+-  setChildFrame(&m_selectableTableView, frame, force);
+-}
++/* ------------------------------------------------------------ controller */
+ 
+ Controller::Controller(Responder* parentResponder,
+                        SelectableTableViewDataSource* selectionDataSource)
+-    : ViewController(parentResponder), m_view(this, selectionDataSource) {}
++    : ViewController(parentResponder), m_active(false) {}
+ 
+-bool Controller::handleEvent(Ion::Events::Event event) {
+-  if (event == Ion::Events::OK || event == Ion::Events::EXE) {
+-    switchToSelectedApp();
+-    return true;
+-  }
+-  if (event == Ion::Events::Home || event == Ion::Events::Back) {
+-    m_view.selectableTableView()->selectCellAtLocation(0, 0);
+-    return true;
++Controller::~Controller() {
++  if (m_active) {
++    Verse::Shell::detach();
+   }
+-  if (event == Ion::Events::Right &&
+-      selectionDataSource()->selectedRow() < numberOfRows() - 1) {
+-    m_view.selectableTableView()->selectCellAtLocation(
+-        0, selectionDataSource()->selectedRow() + 1);
+-    return true;
+-  }
+-  if (event == Ion::Events::Left && selectionDataSource()->selectedRow() > 0) {
+-    m_view.selectableTableView()->selectCellAtLocation(
+-        k_numberOfColumns - 1, selectionDataSource()->selectedRow() - 1);
+-    return true;
++}
++
++bool Controller::handleEvent(Ion::Events::Event event) {
++  bool handled = Verse::Shell::handleEvent(event);
++  if (handled) {
++    m_view.invalidateAll();
+   }
+-  // Handle keys from 0 to 9
+-  const char* eventTextPtr = event.text();
+-  if (eventTextPtr != nullptr && eventTextPtr[0] != 0 && eventTextPtr[1] == 0 &&
+-      eventTextPtr[0] >= '0' && eventTextPtr[0] <= '9') {
+-    int iconIndex;
+-    if (eventTextPtr[0] == '0') {
+-      // Settings app is the last visible builtin app
+-      iconIndex = numberOfIcons() - 1 -
+-                  AppsContainer::sharedAppsContainer()->numberOfExternalApps();
+-    } else {
+-      iconIndex = eventTextPtr[0] - '1';
+-    }
+-    if (iconIndex >= AppsContainer::sharedAppsContainer()->numberOfApps()) {
+-      return false;
+-    }
+-    int col = columnOfIconAtIndex(iconIndex);
+-    int row = rowOfIconAtIndex(iconIndex);
+-    if (col == m_view.selectableTableView()->selectedColumn() &&
+-        row == m_view.selectableTableView()->selectedRow()) {
+-      // We were already on the selected app
+-      switchToSelectedApp();
+-      return true;
+-    }
+-    m_view.selectableTableView()->selectCellAtLocation(col, row);
+-    return true;
++  // Opening an app destroys this controller: it must be the last thing done
++  launch();
++  return handled;
++}
++
++bool Controller::frame() {
++  if (!m_active) {
++    return false;
+   }
+-  // Handle Down when less than 3 icons at last row
+-  if (event == Ion::Events::Down &&
+-      selectionDataSource()->selectedRow() == numberOfRows() - 2) {
+-    // Otherwise would have been handled by SelectableTableView
+-    assert(selectionDataSource()->selectedColumn() > columnOfLastIcon());
+-    m_view.selectableTableView()->selectCellAtLocation(columnOfLastIcon(),
+-                                                       numberOfRows() - 1);
++  if (Verse::Shell::frame()) {
++    m_view.invalidateAll();
+     return true;
+   }
+   return false;
+ }
+ 
+-void Controller::handleResponderChainEvent(ResponderChainEvent event) {
+-  if (event.type == ResponderChainEventType::HasBecomeFirst) {
+-    if (selectionDataSource()->selectedRow() == -1) {
+-      selectionDataSource()->selectCellAtLocation(0, 0);
+-    }
+-    App::app()->setFirstResponder(m_view.selectableTableView());
+-  } else {
+-    ViewController::handleResponderChainEvent(event);
+-  }
+-}
+-
+-HighlightCell* Controller::reusableCell(int index) {
+-  assert(0 <= index && index < reusableCellCount());
+-  return &m_reusableCells[index];
++int Controller::framePeriod() {
++  return m_active ? Verse::Shell::framePeriod() : 0;
+ }
+ 
+-void Controller::fillCellForLocation(HighlightCell* cell, int column, int row) {
+-  AppCell* appCell = static_cast<AppCell*>(cell);
++void Controller::launch() {
++  Verse::Item item = Verse::Shell::takeLaunch();
++  if (item.isNone()) {
++    return;
++  }
+   AppsContainer* container = AppsContainer::sharedAppsContainer();
+-  int appIdx = indexOfAppAtColumnAndRow(column, row);
+-  if (appIdx >= container->numberOfApps()) {
+-    appCell->setVisible(false);
+-  } else {
+-    appCell->setVisible(true);
+-    if (appIdx < container->numberOfBuiltinApps()) {
+-      const ::App::Descriptor* descriptor =
+-          container->appSnapshotAtIndex(PermutedAppSnapshotIndex(appIdx))
+-              ->descriptor();
+-      appCell->setBuiltinAppDescriptor(descriptor);
+-    } else {
+-      Ion::ExternalApps::App a = container->externalAppAtIndex(
+-          appIdx - container->numberOfBuiltinApps());
+-      appCell->setExternalApp(a);
++  if (item.kind == Verse::Item::Kind::External) {
++    if (ExamModeManager::ExamMode().ruleset() != ExamMode::Ruleset::Off) {
++      return;
+     }
++    m_active = false;
++    Verse::Shell::detach();
++    container->switchToExternalApp(container->externalAppAtIndex(item.index));
++    return;
+   }
+-}
+-
+-int Controller::numberOfIcons() const {
+-  AppsContainer* container = AppsContainer::sharedAppsContainer();
+-  assert(container->numberOfApps() > 0);
+-  return container->numberOfApps() - 1;
+-}
+-
+-void Controller::tableViewDidChangeSelectionAndDidScroll(
+-    SelectableTableView* t, int previousSelectedCol, int previousSelectedRow,
+-    KDPoint previousOffset, bool withinTemporarySelection) {
+-  assert(t == m_view.selectableTableView());
+-  /* If the number of icons is != 3*n, when we display the lowest row, no icons
+-   * are redrawn on the last cells, so the cells are not cleaned. We need to
+-   * redraw a white rect on these cells to hide the leftover icons. Ideally, we
+-   * would have redrawn all the background in white and then redraw visible
+-   * cells. However, the redrawing takes time and is visible at scrolling. Here,
+-   * we avoid the background complete redrawing but the code is a bit clumsy. */
+-  if (!withinTemporarySelection && t->selectedRow() == numberOfRows() - 1) {
+-    m_view.reloadBottomRow(this, columnOfLastIcon());
++  ::App::Snapshot* snapshot =
++      container->appSnapshotAtIndex(PermutedAppSnapshotIndex(item.index));
++  if (appIsForbidden(snapshot->descriptor()->name())) {
++    App::app()->displayWarning(forbiddenAppMessage());
++    return;
+   }
++  m_active = false;
++  Verse::Shell::detach();
++  container->switchToBuiltinApp(snapshot);
+ }
+ 
+-SelectableTableViewDataSource* Controller::selectionDataSource() const {
+-  return App::app()->snapshot();
+-}
+-
+-void Controller::switchToSelectedApp() {
+-  AppsContainer* container = AppsContainer::sharedAppsContainer();
+-  int appIdx = indexOfAppAtColumnAndRow(selectionDataSource()->selectedColumn(),
+-                                        selectionDataSource()->selectedRow());
+-  if (appIdx < container->numberOfBuiltinApps()) {
+-    ::App::Snapshot* selectedSnapshot =
+-        container->appSnapshotAtIndex(PermutedAppSnapshotIndex(appIdx));
+-    if (appIsForbidden(selectedSnapshot->descriptor()->name())) {
+-      App::app()->displayWarning(forbiddenAppMessage());
+-    } else {
+-      container->switchToBuiltinApp(selectedSnapshot);
+-    }
++void Controller::handleResponderChainEvent(ResponderChainEvent event) {
++  if (event.type == ResponderChainEventType::HasBecomeFirst) {
++    m_active = true;
++    Verse::Shell::attach(&m_engine);
++    m_view.invalidateAll();
+   } else {
+-    assert(ExamModeManager::ExamMode().ruleset() == ExamMode::Ruleset::Off);
+-    m_view.reload();
+-    Ion::ExternalApps::App a = container->externalAppAtIndex(
+-        appIdx - container->numberOfBuiltinApps());
+-    container->switchToExternalApp(a);
++    ViewController::handleResponderChainEvent(event);
+   }
+ }
+ 
+diff --git a/epsilon/apps/home/controller.h b/epsilon/apps/home/controller.h
+index 7e1e98eb57..61f95b4b3b 100644
+--- a/epsilon/apps/home/controller.h
++++ b/epsilon/apps/home/controller.h
+@@ -1,102 +1,49 @@
+ #pragma once
+ 
+-#include <escher/regular_table_view_data_source.h>
+-#include <escher/selectable_table_view.h>
++#include <apps/i18n.h>
+ #include <escher/selectable_table_view_data_source.h>
+-#include <escher/selectable_table_view_delegate.h>
+-#include <escher/theme/color_picker.h>
+ #include <escher/view_controller.h>
++#include <ion/external_apps.h>
+ 
+-#include "app_cell.h"
++#include "verse/engine.h"
++#include "verse/gfx.h"
+ 
+ namespace Home {
+ 
+-class Controller : public Escher::ViewController,
+-                   public Escher::SimpleTableViewDataSource,
+-                   public Escher::SelectableTableViewDelegate {
++/* NUMVERSE home screen: a first-person 3D world where every calculator app
++ * is a portal (see verse/shell.cpp). This controller only bridges the world
++ * with Escher: events in, frames and drawing out, and opening the
++ * calculator apps and the games. The engine (textures, buffers) is a member:
++ * it only takes RAM while the home app is running. */
++class Controller : public Escher::ViewController {
+  public:
+   Controller(Escher::Responder* parentResponder,
+              Escher::SelectableTableViewDataSource* selectionDataSource);
++  ~Controller();
+ 
+   Escher::View* view() override { return &m_view; }
+-
+   bool handleEvent(Ion::Events::Event event) override;
+-
+-  int numberOfRows() const override {
+-    return ((numberOfIcons() - 1) / k_numberOfColumns) + 1;
+-  }
+-  int numberOfColumns() const override { return k_numberOfColumns; }
+-  Escher::HighlightCell* reusableCell(int index) override;
+-  int reusableCellCount() const override { return k_numberOfReusableCells; }
+-  void fillCellForLocation(Escher::HighlightCell* cell, int column,
+-                           int row) override;
+-  bool canSelectCellAtLocation(int column, int row) override {
+-    assert(column >= 0 && column < numberOfColumns() && row >= 0 &&
+-           row < numberOfRows());
+-    return row < numberOfRows() - 1 || column <= columnOfLastIcon();
+-  }
+-  void tableViewDidChangeSelectionAndDidScroll(
+-      Escher::SelectableTableView* t, int previousSelectedCol,
+-      int previousSelectedRow, KDPoint previousOffset,
+-      bool withinTemporarySelection) override;
++  // Called by the run loop every framePeriod() ms
++  bool frame();
++  int framePeriod();
+ 
+  protected:
+   void handleResponderChainEvent(ResponderChainEvent event) override;
+ 
+  private:
+-  // SimpleTableViewDataSource
+-  KDCoordinate defaultRowHeight() override { return k_cellHeight; }
+-  KDCoordinate defaultColumnWidth() override { return k_cellWidth; }
++  class ContentView : public Escher::View {
++   public:
++    void drawRect(KDContext* ctx, KDRect rect) const override;
++    void invalidateAll() { markRectAsDirty(bounds()); }
++  };
+ 
+-  int numberOfIcons() const;
+-  Escher::SelectableTableViewDataSource* selectionDataSource() const;
+-  void switchToSelectedApp();
++  void launch();
+   bool appIsForbidden(I18n::Message appName) const;
+   I18n::Message forbiddenAppMessage() const;
+ 
+-  // Conversion index <--> column/row
+-  int columnOfIconAtIndex(int iconIndex) const {
+-    return iconIndex % k_numberOfColumns;
+-  }
+-  int rowOfIconAtIndex(int iconIndex) const {
+-    return iconIndex / k_numberOfColumns;
+-  }
+-  int indexOfIconAtColumnAndRow(int column, int row) const {
+-    return row * k_numberOfColumns + column;
+-  }
+-  int indexOfAppAtColumnAndRow(int column, int row) const {
+-    return indexOfIconAtColumnAndRow(column, row) + 1;
+-  }
+-  int columnOfLastIcon() { return columnOfIconAtIndex(numberOfIcons() - 1); }
+-
+-  class ContentView : public Escher::View {
+-   public:
+-    ContentView(Controller* controller,
+-                Escher::SelectableTableViewDataSource* selectionDataSource);
+-    Escher::SelectableTableView* selectableTableView();
+-    void drawRect(KDContext* ctx, KDRect rect) const override {
+-      ctx->fillRect(bounds(), Escher::ColorPicker::Resolve(
+-                                  Escher::ThemeComponent::DefaultBackground));
+-    }
+-    void reload() { markWholeFrameAsDirty(); }
+-    void reloadBottomRow(SimpleTableViewDataSource* dataSource,
+-                         int lastIconColumn);
+-
+-   private:
+-    int numberOfSubviews() const override { return 1; }
+-    View* subviewAtIndex(int index) override;
+-    void layoutSubviews(bool force = false) override;
+-    Escher::SelectableTableView m_selectableTableView;
+-  };
+-  constexpr static KDMargins k_margins = {4, 4, 0, 0};
+-  constexpr static KDCoordinate k_bottomMargin = 14;
+-  constexpr static KDCoordinate k_indicatorMargin = 61;
+-  constexpr static int k_numberOfColumns = 3;
+-  constexpr static int k_numberOfReusableCells = 6;
+-  constexpr static int k_cellHeight = 104;
+-  constexpr static int k_cellWidth = 104;
++  bool m_active;
+   ContentView m_view;
+-  AppCell m_reusableCells[k_numberOfReusableCells];
++  Verse::Engine m_engine;
+ };
+ 
+ }  // namespace Home
+diff --git a/epsilon/apps/home/verse/engine.cpp b/epsilon/apps/home/verse/engine.cpp
+new file mode 100644
+index 0000000000..3f327b443e
+--- /dev/null
++++ b/epsilon/apps/home/verse/engine.cpp
+@@ -0,0 +1,986 @@
++#include "engine.h"
++
++#include <math.h>
++#include <string.h>
++
++namespace Home {
++namespace Verse {
++
++namespace {
++
++/* The world. One character per cell:
++ *   #  wall          %  accent wall      $  secret room wall
++ *   M  monolith      T  pi trophy        =  secret door (10 pi coins)
++ *   a..n  portals to the calculator apps
++ *   A..H  arcade cabinets (the .nwa games)
++ *   .  floor   *  pi coin   S  start   &  the Glitch (a ghost) */
++constexpr char k_map[k_mapHeight][k_mapWidth + 1] = {
++    "########################",  // 0
++    "#%a%b%c%d%e%#%%A%B%C%D%#",  // 1
++    "#...........###.......*#",  // 2
++    "f...........m##........E",  // 3
++    "#...........###........#",  // 4
++    "#..S..M................F",  // 5
++    "#.....M................#",  // 6
++    "g...........n##.G.H....#",  // 7
++    "#..........*###........#",  // 8
++    "#...........#######.####",  // 9
++    "#%h%i%j%k%l%#######.####",  // 10
++    "########.*......#..&..*#",  // 11
++    "$$$$$$$.#.####.#.###.#.#",  // 12
++    "$.....$.#.*..#.#...#...#",  // 13
++    "$..T..$.####.#.#.#.###.#",  // 14
++    "$.....=......#.*.#.....#",  // 15
++    "$.....$#####.#####.###.#",  // 16
++    "$.....$*....*.....*.#*.#",  // 17
++    "$$$$$$$#################",  // 18
++};
++
++constexpr float k_plane = 0.66f;
++constexpr float k_projection = (k_screenWidth / 2) / k_plane;  // px per unit
++constexpr int k_circumference = 1523;  // 2 pi * k_projection, for the sky
++
++inline uint32_t hash(uint32_t x) {
++  x ^= x >> 16;
++  x *= 0x7feb352dU;
++  x ^= x >> 15;
++  x *= 0x846ca68bU;
++  x ^= x >> 16;
++  return x;
++}
++inline uint32_t hash2(int a, int b) {
++  return hash(static_cast<uint32_t>(a) * 73856093U ^
++              static_cast<uint32_t>(b) * 19349663U);
++}
++
++KDColor lerp(uint32_t a, uint32_t b, int t, int n) {
++  if (n <= 0) {
++    return rgb(a);
++  }
++  int ra = (a >> 16) & 255, ga = (a >> 8) & 255, ba = a & 255;
++  int rb = (b >> 16) & 255, gb = (b >> 8) & 255, bb = b & 255;
++  return KDColor::RGB888(ra + (rb - ra) * t / n, ga + (gb - ga) * t / n,
++                         ba + (bb - ba) * t / n);
++}
++
++void ramp(KDColor* palette, int start, int count, uint32_t from,
++          uint32_t to) {
++  for (int i = 0; i < count; i++) {
++    palette[start + i] = lerp(from, to, i, count - 1);
++  }
++}
++
++// 7 x 7 pi, for the coins
++constexpr uint8_t k_piGlyph[7] = {0x00, 0x7F, 0x7F, 0x36, 0x36, 0x36, 0x66};
++
++float normalizeAngle(float a) {
++  while (a > 3.14159265f) {
++    a -= 6.2831853f;
++  }
++  while (a < -3.14159265f) {
++    a += 6.2831853f;
++  }
++  return a;
++}
++
++}  // namespace
++
++/* ------------------------------------------------------------------- map */
++
++char Engine::initialCell(int x, int y) {
++  if (x < 0 || y < 0 || x >= k_mapWidth || y >= k_mapHeight) {
++    return '#';
++  }
++  return k_map[y][x];
++}
++
++char Engine::cell(int x, int y) const {
++  char c = initialCell(x, y);
++  if (c == '*' || c == 'S' || c == '&') {
++    return '.';
++  }
++  if (c == '=' && m_doorOpen) {
++    return '.';
++  }
++  return c;
++}
++
++bool Engine::isSolid(char c) {
++  return !(c == '.' || c == '*' || c == 'S' || c == '&');
++}
++
++/* ----------------------------------------------------------------- setup */
++
++void Engine::setup(Theme theme, bool doorOpen) {
++  m_doorOpen = doorOpen;
++  m_wave = false;
++  m_lowResolution = false;
++  m_flicker = 0;
++  m_time = 0;
++  m_numberOfSprites = 0;
++  m_target = {0, 0, 0, 100.f};
++  for (int i = 0; i < k_appSlots; i++) {
++    m_appUsed[i] = false;
++  }
++  for (int i = 0; i < k_gameSlots; i++) {
++    m_gameState[i] = -1;
++  }
++  glyphMask("\xCF\x80", m_monolithMask);  // pi
++  glyphMask("10\xCF\x80", m_doorMask);
++  // Swirl of the portals: angle + radius, in 1/16 turns
++  for (int v = 0; v < k_tex; v++) {
++    for (int u = 0; u < k_tex; u++) {
++      float dx = u - 15.5f, dy = (v - 17.f) * 0.95f;
++      float a = atan2f(dy, dx) / 6.2831853f;  // -0.5 .. 0.5
++      float r = sqrtf(dx * dx + dy * dy);
++      m_swirl[v * k_tex + u] =
++          static_cast<uint8_t>(static_cast<int>(a * 32.f + r * 0.9f + 64.f));
++    }
++  }
++  setTheme(theme);
++}
++
++void Engine::setDoorOpen(bool open) { m_doorOpen = open; }
++
++void Engine::setAppSymbol(int slot, const char* symbol) {
++  if (slot < 0 || slot >= k_appSlots) {
++    return;
++  }
++  m_appUsed[slot] = symbol != nullptr;
++  uint32_t* mask = m_appSymbols[slot];
++  glyphMask(symbol, mask);
++  // Dark outline: the mask grown by one texel, minus the mask
++  for (int v = 0; v < 32; v++) {
++    uint32_t grown = mask[v] | (mask[v] << 1) | (mask[v] >> 1);
++    if (v > 0) {
++      grown |= mask[v - 1];
++    }
++    if (v < 31) {
++      grown |= mask[v + 1];
++    }
++    m_appOutlines[slot][v] = grown & ~mask[v];
++  }
++}
++
++void Engine::setGame(int slot, const Ion::ExternalApps::App* app) {
++  if (slot < 0 || slot >= k_gameSlots) {
++    return;
++  }
++  if (app == nullptr) {
++    m_gameState[slot] = -1;
++    return;
++  }
++  m_gameState[slot] = gameIconTexture(*app, m_gameIcons[slot], 24, 18) ? 1 : 0;
++}
++
++void Engine::setTheme(Theme theme) {
++  m_theme = theme;
++  generateTextures();
++  buildShades();
++}
++
++/* -------------------------------------------------------------- textures */
++
++void Engine::generateTextures() {
++  KDColor* p = m_palette;
++  uint8_t* wall = m_textures[TexWall];
++  uint8_t* accent = m_textures[TexAccent];
++  // Shared colours: hazard, metal, neon trim
++  ramp(p, 48, 4, 0xB89400, 0xFFD84A);
++  ramp(p, 52, 4, 0x0E0E12, 0x2A2A30);
++  ramp(p, 56, 4, 0x07070C, 0x34344A);
++  uint32_t neon = 0x22E6FF, neon2 = 0xFF3CAC;
++  m_hasCeiling = false;
++  m_fogK = 1.f;
++
++  switch (m_theme) {
++    case Theme::Synthwave: {
++      ramp(p, 0, 16, 0x0E041C, 0x4A1A72);
++      ramp(p, 16, 8, 0x08364A, 0x5FF8FF);
++      ramp(p, 24, 8, 0x4A0C34, 0xFF4FB8);
++      ramp(p, 32, 8, 0x04010A, 0x1E0838);
++      ramp(p, 40, 8, 0x3A0A50, 0xFF3CD6);
++      m_fog = rgb(0x1E0830);
++      m_fogK = 0.7f;
++      for (int v = 0; v < k_tex; v++) {
++        for (int u = 0; u < k_tex; u++) {
++          int i = v * k_tex + u;
++          uint8_t c = 2 + v * 5 / 32 + (hash2(u, v) & 1);
++          if (v == 9 || v == 10) {
++            c = v == 9 ? 23 : 21;
++          } else if (u == 0 || v == 0 || v == 31) {
++            c = 9;
++          } else if (u == 16 && v > 10) {
++            c = 1;
++          }
++          wall[i] = c;
++          int d = (u + (v > 16 ? 32 - v : v)) % 12;
++          accent[i] = d < 2 ? 30 - d * 2 : 2 + (hash2(u, v) & 1);
++          if (v == 0 || v == 31) {
++            accent[i] = 27;
++          }
++          uint8_t f = 32 + (hash2(u + 99, v) & 1);
++          if (u == 0 || v == 0) {
++            f = 47;
++          } else if (u == 1 || v == 1 || u == 31 || v == 31) {
++            f = 43;
++          }
++          m_floor[i] = f;
++        }
++      }
++      for (int y = 0; y < k_screenHeight; y++) {
++        int h = k_screenHeight / 2;
++        m_skyRows[y] = y < h * 6 / 10 ? lerp(0x07021A, 0x3C0F5C, y, h * 6 / 10)
++                                      : lerp(0x3C0F5C, 0xFF6A3D,
++                                             y - h * 6 / 10, h - h * 6 / 10);
++      }
++      break;
++    }
++    case Theme::Liminal: {
++      ramp(p, 0, 16, 0x5C4E1C, 0xE6D27A);
++      ramp(p, 16, 8, 0x30240E, 0x8A6D3B);
++      ramp(p, 24, 8, 0x4E4018, 0xA8923E);
++      ramp(p, 32, 8, 0x473C1E, 0xA8955C);
++      ramp(p, 40, 8, 0x6E6A52, 0xFFFDF0);
++      m_fog = rgb(0x5A5028);
++      m_fogK = 1.35f;
++      m_hasCeiling = true;
++      neon = 0xFFF5B0;
++      neon2 = 0xFFFFFF;
++      for (int v = 0; v < k_tex; v++) {
++        for (int u = 0; u < k_tex; u++) {
++          int i = v * k_tex + u;
++          uint32_t h = hash2(u, v);
++          uint8_t c = 11 + ((u % 8) < 4 ? 1 : 0) + (h & 1);
++          if (u % 8 == 0) {
++            c = 8;
++          }
++          if ((u / 4 + v / 6) % 5 == 0 && (u % 8) == 2) {
++            c = 13;
++          }
++          if (v >= 28) {
++            c = v == 28 ? 22 : 18 + (h & 1);
++          }
++          wall[i] = c;
++          // Stains
++          float dx = u - 20.f, dy = v - 9.f;
++          float d = dx * dx * 0.8f + dy * dy;
++          uint8_t a = c;
++          if (v < 28 && d < 60.f + (h & 15)) {
++            a = c > 4 ? c - 4 : 1;
++          }
++          accent[i] = a;
++          m_floor[i] = 33 + (hash2(u + 7, v + 3) & 3);
++          uint8_t ce = 44 + (h & 1);
++          if (u % 16 == 0 || v % 16 == 0) {
++            ce = 41;
++          } else if (u >= 3 && u <= 12 && v >= 5 && v <= 26) {
++            ce = 47;
++          }
++          m_ceiling[i] = ce;
++        }
++      }
++      break;
++    }
++    case Theme::Matrix: {
++      ramp(p, 0, 16, 0x000000, 0x5BFF9A);
++      ramp(p, 16, 16, 0x001408, 0x0A6A30);
++      ramp(p, 32, 8, 0x000000, 0x00200C);
++      ramp(p, 40, 8, 0x00200C, 0x00FF55);
++      m_fog = rgb(0x000000);
++      m_fogK = 1.15f;
++      neon = 0x3BFF7A;
++      neon2 = 0xC8FFD8;
++      for (int v = 0; v < k_tex; v++) {
++        for (int u = 0; u < k_tex; u++) {
++          int i = v * k_tex + u;
++          uint32_t h = hash2(u, v);
++          wall[i] = (u == 0 || v == 0 || v == 31) ? 20 : k_rain;
++          uint8_t a = 17 + (h & 1);
++          if ((v % 8 == 4 && (u / 4) % 3 != 0) ||
++              (u % 8 == 2 && (v / 4) % 2 == 0)) {
++            a = 27;
++          }
++          if ((u % 8 == 2 && v % 8 == 4)) {
++            a = 12;
++          }
++          accent[i] = a;
++          m_floor[i] = (u == 0 || v == 0) ? 45 : 32 + (h & 1);
++        }
++      }
++      for (int y = 0; y < k_screenHeight; y++) {
++        m_skyRows[y] = rgb(0x000000);
++      }
++      break;
++    }
++    case Theme::Abyss: {
++      ramp(p, 0, 16, 0x061A26, 0x4A9CC0);
++      ramp(p, 16, 8, 0x08301A, 0x4FC46A);
++      ramp(p, 24, 8, 0x501830, 0xFF8A70);
++      ramp(p, 32, 8, 0x2E2818, 0xE6D298);
++      ramp(p, 40, 8, 0x0B3550, 0x9FE8FF);
++      m_fog = rgb(0x0A3048);
++      m_fogK = 1.7f;
++      neon = 0x6BF3FF;
++      neon2 = 0xFFB0E0;
++      for (int v = 0; v < k_tex; v++) {
++        for (int u = 0; u < k_tex; u++) {
++          int i = v * k_tex + u;
++          uint32_t h = hash2(u, v);
++          int row = v / 8;
++          int uu = (u + (row & 1) * 8) % 16;
++          uint8_t c = 6 + (h & 3) + ((hash2(row, (u + (row & 1) * 8) / 16) & 3));
++          if (v % 8 == 0 || uu == 0) {
++            c = 2;
++          }
++          if (v > 22 && (h % 31) < static_cast<uint32_t>((v - 22) * 3)) {
++            c = 18 + (h & 3);
++          }
++          wall[i] = c;
++          float dx = (u % 16) - 8.f, dy = v - 20.f;
++          accent[i] = (dx * dx + dy * dy < 30.f && (h & 3)) ? 26 + (h & 3) : c;
++          float s = sinf(u * 0.4f + v * 0.15f) + sinf(v * 0.55f);
++          m_floor[i] = 34 + static_cast<int>((s + 2.f) * 1.2f) + (h & 1);
++        }
++      }
++      for (int y = 0; y < k_screenHeight; y++) {
++        m_skyRows[y] = lerp(0x8FE2FF, 0x0A3048, y, k_screenHeight / 2);
++      }
++      break;
++    }
++    case Theme::Paper: {
++      ramp(p, 0, 16, 0x8E8E88, 0xFBFAF3);
++      ramp(p, 16, 8, 0xB7CDEB, 0x3A6FC4);
++      ramp(p, 24, 4, 0xF08A8A, 0xD83A3A);
++      ramp(p, 28, 4, 0x1A1A2E, 0x4A4A60);
++      ramp(p, 32, 8, 0xA8A8A0, 0xF7F5EC);
++      ramp(p, 40, 8, 0xC9DAF0, 0x7FA2D8);
++      m_fog = rgb(0xF4F2EA);
++      m_fogK = 0.85f;
++      neon = 0x3A6FC4;
++      neon2 = 0xD83A3A;
++      for (int v = 0; v < k_tex; v++) {
++        for (int u = 0; u < k_tex; u++) {
++          int i = v * k_tex + u;
++          uint8_t c = 15;
++          if (v % 8 == 0) {
++            c = 21;
++          } else if (v % 2 == 0) {
++            c = 17;
++          }
++          if (u == 5) {
++            c = 26;
++          }
++          if (u == 0 || u == 31 || v == 31) {
++            c = 28;
++          }
++          wall[i] = c;
++          uint8_t a = (u % 4 == 0 || v % 4 == 0) ? 18 : 15;
++          if (u == 0 || u == 31 || v == 31 || v == 0) {
++            a = 28;
++          }
++          accent[i] = a;
++          m_floor[i] = (u % 8 == 0 || v % 8 == 0) ? 42 : 39;
++        }
++      }
++      for (int y = 0; y < k_screenHeight; y++) {
++        m_skyRows[y] = lerp(0xFFFFFF, 0xDCE7F5, y, k_screenHeight / 2);
++      }
++      break;
++    }
++    default: {  // Rainbow
++      ramp(p, 0, 16, 0x101010, 0xFFFFFF);
++      ramp(p, 16, 16, 0x200030, 0xFF00FF);
++      ramp(p, 32, 8, 0x000000, 0x202020);
++      ramp(p, 40, 8, 0x404040, 0xFFFFFF);
++      m_fog = rgb(0x120018);
++      m_fogK = 0.6f;
++      neon = 0xFFFFFF;
++      neon2 = 0xFF00FF;
++      for (int v = 0; v < k_tex; v++) {
++        for (int u = 0; u < k_tex; u++) {
++          int i = v * k_tex + u;
++          wall[i] = (u == 0 || v == 0) ? 0 : k_rainbow;
++          accent[i] = ((u / 8 + v / 8) & 1) ? k_rainbow : 15;
++          m_floor[i] = ((u / 16 + v / 16) & 1) ? 32 : 47;
++        }
++      }
++      break;
++    }
++  }
++  m_neon = rgb(neon);
++  ramp(p, 60, 3, neon & 0x7F7F7F, neon);
++  p[63] = rgb(0xFFFFFF);
++  // Portal colours: neon -> neon2 -> neon
++  for (int i = 0; i < 16; i++) {
++    int t = i < 8 ? i : 15 - i;
++    m_portalRamp[i] = lerp(neon, neon2, t, 7);
++  }
++
++  // Shared textures, coloured by the palette of the theme
++  for (int v = 0; v < k_tex; v++) {
++    for (int u = 0; u < k_tex; u++) {
++      int i = v * k_tex + u;
++      uint32_t h = hash2(u + 31, v + 17);
++      uint32_t bit = 0x80000000u >> u;
++      // Monolith: obsidian, neon edges, a glowing pi
++      uint8_t m = 56 + (h % 3 == 0 ? 1 : 0);
++      if (u == 1 || u == 30) {
++        m = 61;
++      }
++      if (m_monolithMask[v] & bit) {
++        m = k_glyph;
++      }
++      m_textures[TexMonolith][i] = m;
++      // Door: hazard stripes, a lock and "10 pi"
++      uint8_t d = ((u + v) / 4) % 2 ? 50 : 53;
++      float dx = u - 15.5f, dy = v - 16.5f;
++      if (dx * dx + dy * dy < 150.f) {
++        d = 56;
++      }
++      if (m_doorMask[v] & bit) {
++        d = k_glyph;
++      }
++      m_textures[TexDoor][i] = d;
++      // Secret room: rainbow walls with dark seams
++      m_textures[TexSecret][i] = (u % 16 == 0 || v % 16 == 0) ? 57 : k_rainbow;
++      // Trophy: a rainbow pi on white marble
++      m_textures[TexTrophy][i] =
++          (m_monolithMask[v] & bit) ? k_rainbow : (h % 7 == 0 ? 59 : 63);
++      // Portal: arch in the accent wall, swirl inside
++      float ex = (u - 15.5f) / 12.5f, ey = (v - 17.f) / 14.f;
++      float e = ex * ex + ey * ey;
++      uint8_t pt = accent[i];
++      if (pt >= 64) {
++        pt = 2;
++      }
++      if (e < 1.f) {
++        pt = k_portalInside;
++      } else if (e < 1.35f) {
++        pt = e < 1.15f ? 62 : 60;
++      }
++      m_textures[TexPortal][i] = pt;
++      // Arcade cabinet
++      uint8_t c = 57;
++      if (u < 2 || u > 29) {
++        c = 58;
++      } else if (v >= 2 && v <= 5 && u >= 3 && u <= 28) {
++        c = k_glyph;
++      } else if (v >= 8 && v <= 25 && u >= 4 && u <= 27) {
++        c = k_screenInside;
++      } else if (v >= 7 && v <= 26 && u >= 3 && u <= 28) {
++        c = 52;
++      } else if (v >= 28 && v <= 29 && (u == 9 || u == 10)) {
++        c = 51;
++      } else if (v >= 28 && v <= 29 && (u == 20 || u == 22)) {
++        c = 62;
++      }
++      m_textures[TexCabinet][i] = c;
++    }
++  }
++}
++
++void Engine::buildShades() {
++  for (int l = 0; l < 16; l++) {
++    int t = l * 230 / 15;
++    for (int i = 0; i < 64; i++) {
++      m_shades[l][i] = mix(m_palette[i], m_fog, t);
++    }
++  }
++}
++
++/* --------------------------------------------------------------- prepare */
++
++void Engine::prepare(const Camera& cam, uint32_t timeMs, const Sprite* sprites,
++                     int numberOfSprites) {
++  m_cam = cam;
++  m_time = timeMs;
++  m_dirX = cosf(cam.angle);
++  m_dirY = sinf(cam.angle);
++  m_planeX = -m_dirY * k_plane;
++  m_planeY = m_dirX * k_plane;
++  m_horizon = k_screenHeight / 2;
++
++  int columnStep = m_lowResolution ? 2 : 1;
++  for (int x = 0; x < k_screenWidth; x += columnStep) {
++    float cameraX = 2.f * x / k_screenWidth - 1.f;
++    float rx = m_dirX + m_planeX * cameraX;
++    float ry = m_dirY + m_planeY * cameraX;
++    int mx = static_cast<int>(cam.x), my = static_cast<int>(cam.y);
++    float ddx = rx == 0.f ? 1e30f : fabsf(1.f / rx);
++    float ddy = ry == 0.f ? 1e30f : fabsf(1.f / ry);
++    int stepX, stepY;
++    float sdx, sdy;
++    if (rx < 0) {
++      stepX = -1;
++      sdx = (cam.x - mx) * ddx;
++    } else {
++      stepX = 1;
++      sdx = (mx + 1.f - cam.x) * ddx;
++    }
++    if (ry < 0) {
++      stepY = -1;
++      sdy = (cam.y - my) * ddy;
++    } else {
++      stepY = 1;
++      sdy = (my + 1.f - cam.y) * ddy;
++    }
++    int side = 0;
++    char hit = '#';
++    for (int i = 0; i < 64; i++) {
++      if (sdx < sdy) {
++        sdx += ddx;
++        mx += stepX;
++        side = 0;
++      } else {
++        sdy += ddy;
++        my += stepY;
++        side = 1;
++      }
++      hit = cell(mx, my);
++      if (isSolid(hit)) {
++        break;
++      }
++    }
++    float dist = side == 0 ? sdx - ddx : sdy - ddy;
++    if (dist < 0.05f) {
++      dist = 0.05f;
++    }
++    float wallX = side == 0 ? cam.y + dist * ry : cam.x + dist * rx;
++    wallX -= floorf(wallX);
++    int u = static_cast<int>(wallX * k_tex);
++    // Mirror where needed so that the symbols read left to right
++    if ((side == 0 && rx < 0) || (side == 1 && ry > 0)) {
++      u = k_tex - 1 - u;
++    }
++    Column& c = m_columns[x];
++    c.distance = dist;
++    float scale = k_projection / dist;
++    float top = m_horizon - (1.f - cam.z) * scale;
++    float bottom = m_horizon + cam.z * scale;
++    c.top = static_cast<int16_t>(top < -4000 ? -4000 : top);
++    c.bottom = static_cast<int16_t>(bottom > 4000 ? 4000 : bottom);
++    c.vStep = static_cast<int32_t>(k_tex * 65536.f / scale);
++    c.u = static_cast<uint8_t>(u & (k_tex - 1));
++    int shade = static_cast<int>(dist * m_fogK) + (side ? 1 : 0);
++    c.shade = static_cast<uint8_t>(shade > 15 ? 15 : shade);
++    c.slot = -1;
++    c.cellHash = static_cast<uint8_t>(hash2(mx, my));
++    if (hit >= 'a' && hit <= 'n') {
++      c.slot = hit - 'a';
++      c.tex = m_appUsed[c.slot] ? TexPortal : TexAccent;
++    } else if (hit >= 'A' && hit <= 'H') {
++      c.slot = hit - 'A';
++      c.tex = TexCabinet;
++    } else {
++      switch (hit) {
++        case '%': c.tex = TexAccent; break;
++        case '$': c.tex = TexSecret; break;
++        case 'M': c.tex = TexMonolith; break;
++        case 'T': c.tex = TexTrophy; break;
++        case '=': c.tex = TexDoor; break;
++        default: c.tex = TexWall; break;
++      }
++    }
++    if (x == k_screenWidth / 2) {
++      m_target = {hit, mx, my, dist};
++    }
++    if (columnStep == 2) {
++      m_columns[x + 1] = c;
++    }
++  }
++
++  m_pulse = static_cast<int16_t>(180 + 70.f * sinf(m_time * 0.006f));
++
++  // Sky: per column data and the sun
++  int offset = static_cast<int>(cam.angle * k_projection);
++  for (int x = 0; x < k_screenWidth; x++) {
++    int wx = ((x + offset) % k_circumference + k_circumference) % k_circumference;
++    m_skyWx[x] = static_cast<int16_t>(wx);
++    if (m_theme == Theme::Abyss) {
++      float ray = sinf(wx * 0.045f + m_time * 0.0007f) +
++                  sinf(wx * 0.021f - m_time * 0.0011f);
++      m_skyRay[x] = ray > 1.3f ? static_cast<uint8_t>((ray - 1.3f) * 200.f) : 0;
++    }
++  }
++  float sunAzimuth = m_theme == Theme::Paper ? -0.9f : 0.f;
++  float sunDiff = normalizeAngle(sunAzimuth - cam.angle);
++  m_sunVisible = fabsf(sunDiff) < 1.1f;
++  m_sunX = m_sunVisible ? static_cast<int16_t>(k_screenWidth / 2 +
++                                               tanf(sunDiff) * k_projection)
++                        : 0;
++
++  // Sprites, sorted from the farthest
++  m_numberOfSprites = 0;
++  for (int i = 0; i < numberOfSprites && m_numberOfSprites < k_maxSprites;
++       i++) {
++    const Sprite& s = sprites[i];
++    float relX = s.x - cam.x, relY = s.y - cam.y;
++    float depth = m_dirX * relX + m_dirY * relY;
++    if (depth < 0.15f) {
++      continue;
++    }
++    float tx = (m_dirX * relY - m_dirY * relX) / k_plane;
++    int sx = static_cast<int>(k_screenWidth / 2 * (1.f + tx / depth));
++    int half = static_cast<int>(s.size * k_projection / depth / 2.f);
++    if (half < 1 || sx + half < 0 || sx - half >= k_screenWidth || half > 400) {
++      continue;
++    }
++    int sy = static_cast<int>(m_horizon + (cam.z - s.z) * k_projection / depth);
++    Projected& p = m_sprites[m_numberOfSprites++];
++    p.sx = sx;
++    p.sy = sy;
++    p.half = half;
++    p.depth = depth;
++    p.kind = s.kind;
++    p.param = s.param;
++    int shade = static_cast<int>(depth * m_fogK);
++    p.shade = shade > 15 ? 15 : shade;
++    float spin = fabsf(cosf(m_time * 0.004f + p.param));
++    p.spin = spin < 0.12f ? 0.12f : spin;
++  }
++  for (int i = 1; i < m_numberOfSprites; i++) {
++    Projected p = m_sprites[i];
++    int j = i - 1;
++    while (j >= 0 && m_sprites[j].depth < p.depth) {
++      m_sprites[j + 1] = m_sprites[j];
++      j--;
++    }
++    m_sprites[j + 1] = p;
++  }
++}
++
++/* ---------------------------------------------------------------- render */
++
++KDColor Engine::wallTexel(const Column& c, int y) const {
++  int v = (((y - c.top) * c.vStep) >> 16) & (k_tex - 1);
++  int u = c.u;
++  uint8_t t = m_textures[c.tex][v * k_tex + u];
++  int shade = c.shade + m_flicker;
++  if (shade > 15) {
++    shade = 15;
++  }
++  if (t < 64) {
++    return m_shades[shade][t];
++  }
++  KDColor col;
++  int glow = shade * 9;  // emissive texels only fade a little
++  switch (t) {
++    case k_portalInside: {
++      if (c.slot >= 0 && (m_appSymbols[c.slot][v] & (0x80000000u >> u))) {
++        col = KDColor::RGB888(255, 255, 255);
++      } else if (c.slot >= 0 &&
++                 (m_appOutlines[c.slot][v] & (0x80000000u >> u))) {
++        col = KDColor::RGB888(10, 4, 24);
++      } else {
++        int s = (m_swirl[v * k_tex + u] + static_cast<int>(m_time / 70)) & 15;
++        col = m_portalRamp[s];
++        // dark centre: depth
++        int dx = u - 16, dy = v - 17;
++        int d2 = dx * dx + dy * dy;
++        if (d2 < 30) {
++          col = mix(col, rgb(0x000000), 160 - d2 * 5);
++        }
++      }
++      break;
++    }
++    case k_screenInside: {
++      int sx = u - 4, sy = v - 8;
++      int state = c.slot >= 0 ? m_gameState[c.slot] : -1;
++      if (state == 1) {
++        col = KDColor::RGB16(m_gameIcons[c.slot][sy * 24 + sx]);
++        if (sy % 3 == 0) {
++          col = mix(col, rgb(0x000000), 60);  // scanlines
++        }
++      } else if (state == 0) {
++        int s = (sx + sy * 2 + static_cast<int>(m_time / 60)) & 15;
++        col = m_portalRamp[s];
++      } else {
++        // No game: TV static
++        uint32_t h = hash2(sx + static_cast<int>(m_time / 50) * 37, sy);
++        int g = 40 + (h & 127);
++        col = KDColor::RGB888(g, g, g);
++      }
++      break;
++    }
++    case k_rainbow: {
++      col = hsv((u + v) * 6 + static_cast<int>(m_time / 8), 210, 255);
++      break;
++    }
++    case k_rain: {
++      uint32_t h = hash(u * 977 + c.cellHash * 131);
++      int speed = 6 + (h & 7);
++      int head = static_cast<int>((m_time * speed / 600 + h) % 40);
++      int d = head - v;
++      if (d < 0) {
++        d += 40;
++      }
++      if (d < 14 &&
++          (hash2(u + c.cellHash, (v + static_cast<int>(m_time / 400)) / 2) & 3)) {
++        int g = d == 0 ? 255 : 220 - d * 14;
++        col = d == 0 ? KDColor::RGB888(200, 255, 210)
++                     : KDColor::RGB888(0, g, g / 3);
++      } else {
++        col = KDColor::RGB888(0, 12, 4);
++      }
++      glow = shade * 14;
++      break;
++    }
++    default: {  // k_glyph
++      int pulse = m_pulse;
++      col = mix(rgb(0x000000), m_neon, pulse);
++      if (c.tex == TexDoor) {
++        col = KDColor::RGB888(pulse, 30, 40);
++      }
++      break;
++    }
++  }
++  return mix(col, m_fog, glow);
++}
++
++KDColor Engine::skyPixel(int x, int y) const {
++  int wx = m_skyWx[x];
++  switch (m_theme) {
++    case Theme::Synthwave: {
++      KDColor c = m_skyRows[y];
++      // Striped sun in the east
++      if (m_sunVisible) {
++        int sunX = m_sunX;
++        int sunY = m_horizon - 34;
++        int dx = x - sunX, dy = y - sunY;
++        constexpr int R = 44;
++        if (dx * dx + dy * dy < R * R) {
++          bool gap = dy > 0 && ((dy + static_cast<int>(m_time / 90)) % 9) <
++                                   (dy * 6 / R);
++          if (!gap) {
++            return lerp(0xFFE45C, 0xFF2E88, dy + R, 2 * R);
++          }
++        }
++      }
++      if (y < m_horizon - 50) {
++        uint32_t h = hash2(wx >> 1, y >> 1);
++        if ((h & 511) < 2) {
++          int tw = (h >> 12) & 1 ? 255 : 160 + ((m_time / 200 + h) & 63);
++          return KDColor::RGB888(tw, tw, 255);
++        }
++      }
++      return c;
++    }
++    case Theme::Matrix: {
++      int column = wx >> 2;
++      uint32_t h = hash(column + 1000);
++      int speed = 30 + (h & 63);
++      int span = m_horizon + 40;
++      int head = static_cast<int>((m_time * speed / 1000 + h) % span);
++      int d = head - y;
++      if (d >= 0 && d < 40 && (wx & 3) != 3 &&
++          (hash2(column, (y >> 2) + static_cast<int>(m_time / 300)) & 1)) {
++        int g = d == 0 ? 255 : 200 - d * 5;
++        return d == 0 ? KDColor::RGB888(190, 255, 200)
++                      : KDColor::RGB888(0, g, g / 4);
++      }
++      return KDColor::RGB888(0, 0, 0);
++    }
++    case Theme::Abyss: {
++      KDColor c = m_skyRows[y];
++      if (m_skyRay[x]) {
++        c = mix(c, rgb(0xCFF6FF), m_skyRay[x]);
++      }
++      return c;
++    }
++    case Theme::Paper: {
++      KDColor c = m_skyRows[y];
++      if (m_sunVisible) {
++        int sunX = m_sunX;
++        int sunY = 40;
++        int dx = x - sunX, dy = y - sunY;
++        int d2 = dx * dx + dy * dy;
++        if (d2 > 17 * 17 && d2 < 19 * 19) {
++          return rgb(0x2A2A40);
++        }
++        // Doodled rays
++        if (d2 > 24 * 24 && d2 < 36 * 36) {
++          float a = atan2f(dy, dx) + m_time * 0.0005f;
++          float k = a * 8.f / 6.2831853f;
++          if (fabsf(k - roundf(k)) < 0.06f) {
++            return rgb(0xE8A33A);
++          }
++        }
++      }
++      // Notebook lines in the sky, why not
++      if (y % 16 == 0) {
++        return mix(c, rgb(0x9DB8E6), 90);
++      }
++      return c;
++    }
++    default:  // Rainbow
++      return hsv(y * 2 + wx / 4 + static_cast<int>(m_time / 10), 170, 120);
++  }
++}
++
++KDColor Engine::spritePixel(const Projected& p, int x, int y, bool* hit) const {
++  float u = (x - p.sx) / static_cast<float>(p.half);
++  float v = (y - p.sy) / static_cast<float>(p.half);
++  *hit = false;
++  KDColor col;
++  switch (p.kind) {
++    case SpriteKind::Coin: {
++      float uu = u / p.spin;
++      float r2 = uu * uu + v * v;
++      if (r2 > 0.81f) {
++        return col;
++      }
++      *hit = true;
++      if (r2 > 0.55f) {
++        col = rgb(0xC08A10);
++      } else {
++        col = rgb(0xFFD23F);
++        int gx = static_cast<int>((uu + 0.6f) * 5.84f);
++        int gy = static_cast<int>((v + 0.6f) * 5.84f);
++        if (gx >= 0 && gx < 7 && gy >= 0 && gy < 7 &&
++            (k_piGlyph[gy] & (0x40 >> gx))) {
++          col = rgb(0xA0640A);
++        }
++        if (uu < -0.15f && v < -0.2f && r2 < 0.35f && r2 > 0.12f) {
++          col = rgb(0xFFF6C8);
++        }
++      }
++      break;
++    }
++    case SpriteKind::Ghost: {
++      // Glitch slices
++      uint32_t slice = hash2(y >> 2, static_cast<int>(m_time / 90));
++      if ((slice & 7) == 0) {
++        u += ((slice >> 8) & 1) ? 0.25f : -0.25f;
++      }
++      bool inside;
++      if (v < 0) {
++        inside = u * u + v * v < 0.8f;
++      } else {
++        inside = fabsf(u) < 0.894f &&
++                 v < 0.75f + 0.15f * sinf(u * 11.f + m_time * 0.012f);
++      }
++      if (!inside) {
++        return col;
++      }
++      *hit = true;
++      col = hsv(static_cast<int>(m_time / 6) + y * 4, 90, 255);
++      if ((slice & 7) == 0) {
++        col = KDColor::RGB888(255 - col.red(), 255 - col.green(),
++                              255 - col.blue());
++      }
++      float ex = fabsf(u) - 0.33f, ey = (v + 0.2f) * 0.6f;
++      if (ex * ex + ey * ey < 0.022f) {
++        col = rgb(0x0A0014);
++      }
++      float mx = u, my = (v - 0.28f) * 1.4f;
++      if (mx * mx + my * my < 0.025f) {
++        col = rgb(0x0A0014);
++      }
++      break;
++    }
++    default: {  // Spark
++      float d = fabsf(u) + fabsf(v);
++      if (d > 1.f || (fabsf(u) > 0.15f && fabsf(v) > 0.15f)) {
++        return col;
++      }
++      *hit = true;
++      col = hsv(p.param * 40 + static_cast<int>(m_time / 4), 120, 255);
++      break;
++    }
++  }
++  return mix(col, m_fog, p.shade * 10);
++}
++
++void Engine::render(Band& b) const {
++  const Rect& area = b.area();
++  float rx0 = m_dirX - m_planeX, ry0 = m_dirY - m_planeY;
++  float rx1 = m_dirX + m_planeX, ry1 = m_dirY + m_planeY;
++  for (int y = area.y; y < area.bottom(); y++) {
++    KDColor* row = b.row(y);
++    // Floor or ceiling under / above the horizon on this row
++    bool below = y > m_horizon;
++    bool plane = below || m_hasCeiling;
++    int32_t fx = 0, fy = 0, sx = 0, sy = 0;
++    int planeShade = 15;
++    const uint8_t* planeTex = below ? m_floor : m_ceiling;
++    if (plane && y != m_horizon) {
++      float rowDist = below ? m_cam.z * k_projection / (y - m_horizon + 0.5f)
++                            : (1.f - m_cam.z) * k_projection /
++                                  (m_horizon - y + 0.5f);
++      float wx = m_cam.x + rowDist * rx0, wy = m_cam.y + rowDist * ry0;
++      fx = static_cast<int32_t>(wx * 65536.f);
++      fy = static_cast<int32_t>(wy * 65536.f);
++      sx = static_cast<int32_t>(rowDist * (rx1 - rx0) / k_screenWidth * 65536.f);
++      sy = static_cast<int32_t>(rowDist * (ry1 - ry0) / k_screenWidth * 65536.f);
++      planeShade = static_cast<int>(rowDist * m_fogK) + m_flicker;
++      if (planeShade > 15) {
++        planeShade = 15;
++      }
++    }
++    const KDColor* shades = m_shades[planeShade];
++    int step = m_lowResolution ? 2 : 1;
++    if (step == 2) {
++      sx *= 2;
++      sy *= 2;
++    }
++    for (int x = 0; x < k_screenWidth; x += step) {
++      const Column& c = m_columns[x];
++      if (y >= c.top && y < c.bottom) {
++        row[x] = wallTexel(c, y);
++      } else if (plane && y != m_horizon) {
++        int tu = (fx >> 11) & (k_tex - 1);
++        int tv = (fy >> 11) & (k_tex - 1);
++        uint8_t t = planeTex[tv * k_tex + tu];
++        if (t < 64) {
++          row[x] = shades[t];
++        } else {
++          row[x] = hsv((fx >> 13) + (fy >> 13) + m_time / 8, 200, 220);
++        }
++      } else {
++        row[x] = y == m_horizon && !m_hasCeiling && m_theme == Theme::Synthwave
++                     ? rgb(0xFF5FD0)
++                     : skyPixel(x, y);
++      }
++      if (step == 2) {
++        row[x + 1] = row[x];
++      }
++      fx += sx;
++      fy += sy;
++    }
++    // Sprites
++    for (int i = 0; i < m_numberOfSprites; i++) {
++      const Projected& p = m_sprites[i];
++      if (y < p.sy - p.half || y > p.sy + p.half) {
++        continue;
++      }
++      int x0 = p.sx - p.half < 0 ? 0 : p.sx - p.half;
++      int x1 = p.sx + p.half >= k_screenWidth ? k_screenWidth - 1
++                                              : p.sx + p.half;
++      for (int x = x0; x <= x1; x++) {
++        if (p.depth >= m_columns[x].distance) {
++          continue;
++        }
++        bool hit;
++        KDColor col = spritePixel(p, x, y, &hit);
++        if (hit) {
++          row[x] = p.kind == SpriteKind::Ghost
++                       ? KDColor::Blend(col, row[x], 215)
++                       : col;
++        }
++      }
++    }
++    // Underwater wobble
++    if (m_wave) {
++      int off = static_cast<int>(sinf(y * 0.09f + m_time * 0.004f) * 3.f);
++      if (off > 0) {
++        memmove(row + off, row, (k_screenWidth - off) * sizeof(KDColor));
++      } else if (off < 0) {
++        memmove(row, row - off, (k_screenWidth + off) * sizeof(KDColor));
++      }
++    }
++  }
++}
++
++}  // namespace Verse
++}  // namespace Home
+diff --git a/epsilon/apps/home/verse/engine.h b/epsilon/apps/home/verse/engine.h
+new file mode 100644
+index 0000000000..9852e2b235
+--- /dev/null
++++ b/epsilon/apps/home/verse/engine.h
+@@ -0,0 +1,177 @@
++#pragma once
++
++/* NUMVERSE 3D engine: a textured raycaster (walls, floor, ceiling or sky,
++ * billboard sprites) that renders the world one band at a time.
++ *
++ * The world is a 24 x 19 grid. Walls are 1 unit high, the eye is at 0.5
++ * (higher while jumping). Every texture is generated procedurally for the
++ * current "reality" (theme): nothing is stored in flash but the map. */
++
++#include <ion/external_apps.h>
++#include <stdint.h>
++
++#include "gfx.h"
++
++namespace Home {
++namespace Verse {
++
++constexpr int k_mapWidth = 24;
++constexpr int k_mapHeight = 19;
++constexpr int k_tex = 32;
++
++// Portal slots in the map: 'a'..'n' calculator apps, 'A'..'H' games
++constexpr int k_appSlots = 14;
++constexpr int k_gameSlots = 8;
++constexpr int k_maxCoins = 10;
++
++enum class Theme : uint8_t {
++  Synthwave = 0,
++  Liminal,
++  Matrix,
++  Abyss,
++  Paper,
++  Rainbow,  // hidden: unlocked in the secret room
++  NumberOfThemes
++};
++constexpr int k_numberOfThemes = static_cast<int>(Theme::NumberOfThemes);
++
++struct Camera {
++  float x, y;   // position in cells
++  float angle;  // radians, 0 = +x (east)
++  float z;      // eye height, 0.5 = standing
++};
++
++enum class SpriteKind : uint8_t { Coin, Ghost, Spark };
++
++struct Sprite {
++  float x, y, z;  // z: height of the centre
++  float size;     // world size (1 = one cell)
++  SpriteKind kind;
++  uint8_t param;
++};
++
++// What the centre of the screen is looking at
++struct Target {
++  char cell;  // map character, 0 if nothing
++  int cx, cy;
++  float distance;
++};
++
++class Engine {
++ public:
++  constexpr static int k_maxSprites = 16;
++
++  void setup(Theme theme, bool doorOpen);
++  void setTheme(Theme theme);
++  Theme theme() const { return m_theme; }
++  void setDoorOpen(bool open);
++  void setAppSymbol(int slot, const char* symbol);  // nullptr: empty slot
++  void setGame(int slot, const Ion::ExternalApps::App* app);
++  void setFlicker(int levels) { m_flicker = levels; }
++  void setWave(bool wave) { m_wave = wave; }
++  // Half horizontal resolution, if the calculator cannot keep up
++  void setLowResolution(bool low) { m_lowResolution = low; }
++  bool lowResolution() const { return m_lowResolution; }
++
++  // Map
++  char cell(int x, int y) const;
++  static bool isSolid(char c);
++  static bool isFloor(char c) { return !isSolid(c); }
++  // Initial map markers (coins '*', start 'S', ghost '&')
++  static char initialCell(int x, int y);
++
++  // Raycasts every column and projects the sprites
++  void prepare(const Camera& cam, uint32_t timeMs, const Sprite* sprites,
++               int numberOfSprites);
++  // Draws world and sprites into the band
++  void render(Band& b) const;
++  const Target& target() const { return m_target; }
++  KDColor fogColor() const { return m_fog; }
++  KDColor neonColor() const { return m_neon; }
++
++ private:
++  struct Column {
++    float distance;
++    int16_t top, bottom;  // unclipped wall span [top, bottom)
++    int32_t vStep;        // texel step per pixel, 16.16
++    uint8_t tex;          // texture index
++    uint8_t u;            // texel column
++    uint8_t shade;        // fog level 0..15
++    int8_t slot;          // portal / cabinet slot, -1 otherwise
++    uint8_t cellHash;     // varies the animated textures from cell to cell
++  };
++  struct Projected {
++    int16_t sx, sy, half;
++    float depth;
++    SpriteKind kind;
++    uint8_t param;
++    uint8_t shade;
++    float spin;  // coins: width factor of the spinning disc
++  };
++  enum Texture : uint8_t {
++    TexWall = 0,
++    TexAccent,
++    TexMonolith,
++    TexDoor,
++    TexSecret,
++    TexPortal,
++    TexCabinet,
++    TexTrophy,
++    NumberOfTextures
++  };
++  // Special texel values (above the 64 palette colours)
++  constexpr static uint8_t k_portalInside = 255;
++  constexpr static uint8_t k_screenInside = 254;
++  constexpr static uint8_t k_rainbow = 253;
++  constexpr static uint8_t k_rain = 252;
++  constexpr static uint8_t k_glyph = 251;
++
++  void generateTextures();
++  void buildShades();
++  KDColor wallTexel(const Column& c, int v) const;
++  KDColor skyPixel(int x, int y) const;
++  KDColor spritePixel(const Projected& p, int x, int y, bool* hit) const;
++
++  Theme m_theme;
++  bool m_doorOpen;
++  bool m_wave;
++  bool m_lowResolution;
++  int m_flicker;
++  uint32_t m_time;
++  Camera m_cam;
++  float m_dirX, m_dirY, m_planeX, m_planeY;
++  int m_horizon;
++  Target m_target;
++  KDColor m_fog, m_neon;
++  float m_fogK;
++  bool m_hasCeiling;
++
++  uint8_t m_textures[NumberOfTextures][k_tex * k_tex];
++  uint8_t m_floor[k_tex * k_tex];
++  uint8_t m_ceiling[k_tex * k_tex];
++  uint8_t m_swirl[k_tex * k_tex];
++  KDColor m_palette[64];
++  KDColor m_shades[16][64];
++  KDColor m_portalRamp[16];
++  KDColor m_skyRows[k_screenHeight];
++  uint32_t m_appSymbols[k_appSlots][32];
++  uint32_t m_appOutlines[k_appSlots][32];
++  bool m_appUsed[k_appSlots];
++  uint32_t m_monolithMask[32];
++  uint32_t m_doorMask[32];
++  uint16_t m_gameIcons[k_gameSlots][24 * 18];
++  int8_t m_gameState[k_gameSlots];  // -1 empty, 0 no icon, 1 icon
++  Column m_columns[k_screenWidth];
++  // Sky, computed once per frame
++  int16_t m_skyWx[k_screenWidth];  // horizontal sky coordinate of each column
++  uint8_t m_skyRay[k_screenWidth];  // underwater light rays
++  int16_t m_sunX;
++  int16_t m_pulse;  // glowing glyphs, 110..250
++  bool m_sunVisible;
++  Projected m_sprites[k_maxSprites];
++  int m_numberOfSprites;
++  // Per-row floor data for the band being drawn is computed on the fly
++};
++
++}  // namespace Verse
++}  // namespace Home
+diff --git a/epsilon/apps/home/verse/gfx.cpp b/epsilon/apps/home/verse/gfx.cpp
+new file mode 100644
+index 0000000000..0993443829
+--- /dev/null
++++ b/epsilon/apps/home/verse/gfx.cpp
+@@ -0,0 +1,515 @@
++#include "gfx.h"
++
++#include <kandinsky/context.h>
++#include <math.h>
++#include <omg/memory.h>
++#include <string.h>
++
++namespace Home {
++namespace Verse {
++
++namespace {
++
++KDColor s_band[k_screenWidth * Band::k_maxHeight];
++
++/* Text is rasterized white on black in this buffer; the green channel is
++ * then the glyph coverage. The buffer also receives decompressed .nwa
++ * icons (never at the same time). */
++constexpr int k_textBufferWidth = 240;
++constexpr int k_textBufferHeight = 18;
++KDColor s_textBuffer[k_textBufferWidth * k_textBufferHeight];
++
++constexpr int k_nwaIconWidth = 55;
++constexpr int k_nwaIconHeight = 56;
++static_assert(k_nwaIconWidth * k_nwaIconHeight <=
++                  k_textBufferWidth * k_textBufferHeight,
++              "The text buffer must be able to hold a .nwa icon");
++
++class TextContext : public KDContext {
++ public:
++  TextContext()
++      : KDContext(KDPointZero,
++                  KDRect(0, 0, k_textBufferWidth, k_textBufferHeight)) {}
++
++ protected:
++  void pushRect(KDRect rect, const KDColor* pixels) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      memcpy(s_textBuffer + (rect.y() + j) * k_textBufferWidth + rect.x(),
++             pixels + j * rect.width(), rect.width() * sizeof(KDColor));
++    }
++  }
++  void pushRectUniform(KDRect rect, KDColor color) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      KDColor* r = s_textBuffer + (rect.y() + j) * k_textBufferWidth + rect.x();
++      for (KDCoordinate i = 0; i < rect.width(); i++) {
++        r[i] = color;
++      }
++    }
++  }
++  void pullRect(KDRect rect, KDColor* pixels) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      memcpy(pixels + j * rect.width(),
++             s_textBuffer + (rect.y() + j) * k_textBufferWidth + rect.x(),
++             rect.width() * sizeof(KDColor));
++    }
++  }
++};
++
++/* Epsilon's fonts draw accented letters as a base letter followed by a
++ * combining mark (the translations are stored that way). The NUMVERSE texts
++ * are written with precomposed letters: decompose them on the fly. */
++const char* decompose(const char* s, char* buffer, int size) {
++  // Base letter and combining mark (second byte after 0xCC) for C3 80..9F
++  static constexpr char k_base[32] = {
++      'A', 'A', 'A', 0,   'A', 0,   0,   'C', 'E', 'E', 'E', 'E', 'I', 'I',
++      'I', 'I', 0,   0,   'O', 'O', 'O', 0,   'O', 0,   0,   'U', 'U', 'U',
++      'U', 0,   0,   0};
++  static constexpr uint8_t k_mark[32] = {
++      0x80, 0x81, 0x82, 0,    0x88, 0,    0,    0xA7, 0x80, 0x81, 0x82,
++      0x88, 0x80, 0x81, 0x82, 0x88, 0,    0,    0x80, 0x81, 0x82, 0,
++      0x88, 0,    0,    0x80, 0x81, 0x82, 0x88, 0,    0,    0};
++  bool needed = false;
++  for (const char* p = s; *p; p++) {
++    if (static_cast<uint8_t>(*p) == 0xC3) {
++      needed = true;
++      break;
++    }
++  }
++  if (!needed) {
++    return s;
++  }
++  int n = 0;
++  for (const char* p = s; *p && n < size - 4; p++) {
++    uint8_t c = static_cast<uint8_t>(*p);
++    uint8_t next = static_cast<uint8_t>(p[1]);
++    if (c == 0xC3 && next >= 0x80 && next <= 0xBF) {
++      int i = next >= 0xA0 ? next - 0xA0 : next - 0x80;
++      if (k_base[i]) {
++        char base = k_base[i];
++        if (next >= 0xA0) {
++          base = base - 'A' + 'a';
++        }
++        buffer[n++] = base;
++        buffer[n++] = static_cast<char>(0xCC);
++        buffer[n++] = static_cast<char>(k_mark[i]);
++        p++;
++        continue;
++      }
++    }
++    buffer[n++] = *p;
++  }
++  buffer[n] = 0;
++  return buffer;
++}
++
++// Renders s into the text buffer; returns its size
++KDSize rasterize(const char* s, KDFont::Size font) {
++  KDSize size = KDFont::Font(font)->stringSize(s);
++  int w = size.width() < k_textBufferWidth ? size.width() : k_textBufferWidth;
++  int h = size.height() < k_textBufferHeight ? size.height()
++                                             : k_textBufferHeight;
++  TextContext ctx;
++  ctx.fillRect(KDRect(0, 0, w, h), KDBlack);
++  ctx.drawString(s, KDPointZero,
++                 {.glyphColor = KDWhite,
++                  .backgroundColor = KDBlack,
++                  .font = font});
++  return KDSize(w, h);
++}
++
++/* Coverage (0..256) of the pixel (px, py) of a rounded rectangle, 0 outside.
++ * Only the corners are curved; they are antialiased on one pixel. */
++int roundCoverage(const Rect& r, int radius, int px, int py) {
++  int cx, cy;
++  if (px < r.x + radius) {
++    cx = r.x + radius;
++  } else if (px >= r.right() - radius) {
++    cx = r.right() - radius - 1;
++  } else {
++    return 256;
++  }
++  if (py < r.y + radius) {
++    cy = r.y + radius;
++  } else if (py >= r.bottom() - radius) {
++    cy = r.bottom() - radius - 1;
++  } else {
++    return 256;
++  }
++  float dx = (px - cx) + (px < cx ? 0.5f : -0.5f);
++  float dy = (py - cy) + (py < cy ? 0.5f : -0.5f);
++  float d = sqrtf(dx * dx + dy * dy);
++  float edge = radius + 0.5f - d;
++  if (edge >= 1.f) {
++    return 256;
++  }
++  if (edge <= 0.f) {
++    return 0;
++  }
++  return static_cast<int>(edge * 256);
++}
++
++}  // namespace
++
++/* ------------------------------------------------------------------ rect */
++
++Rect Rect::intersection(const Rect& o) const {
++  int x0 = x > o.x ? x : o.x;
++  int y0 = y > o.y ? y : o.y;
++  int x1 = right() < o.right() ? right() : o.right();
++  int y1 = bottom() < o.bottom() ? bottom() : o.bottom();
++  return {x0, y0, x1 - x0, y1 - y0};
++}
++
++/* ------------------------------------------------------------------ band */
++
++void Band::begin(Rect area) {
++  m_area = area;
++  m_clip = area;
++}
++
++bool Band::setClip(Rect r) {
++  m_clip = r.intersection(m_area);
++  return !m_clip.isEmpty();
++}
++
++KDColor* Band::row(int y) const {
++  return s_band + (y - m_area.y) * m_area.w - m_area.x;
++}
++
++const KDColor* Band::pixels() const { return s_band; }
++
++/* ---------------------------------------------------------------- colors */
++
++KDColor mix(KDColor a, KDColor b, int t) {
++  if (t <= 0) {
++    return a;
++  }
++  if (t >= 256) {
++    return b;
++  }
++  return KDColor::Blend(b, a, static_cast<uint8_t>(t > 255 ? 255 : t));
++}
++
++KDColor hsv(int hue, int sat, int val) {
++  hue %= 360;
++  if (hue < 0) {
++    hue += 360;
++  }
++  int region = hue / 60;
++  int rem = (hue - region * 60) * 255 / 60;
++  int p = (val * (255 - sat)) >> 8;
++  int q = (val * (255 - ((sat * rem) >> 8))) >> 8;
++  int t = (val * (255 - ((sat * (255 - rem)) >> 8))) >> 8;
++  int r, g, b;
++  switch (region) {
++    case 0: r = val; g = t; b = p; break;
++    case 1: r = q; g = val; b = p; break;
++    case 2: r = p; g = val; b = t; break;
++    case 3: r = p; g = q; b = val; break;
++    case 4: r = t; g = p; b = val; break;
++    default: r = val; g = p; b = q; break;
++  }
++  return KDColor::RGB888(r, g, b);
++}
++
++/* ------------------------------------------------------------ primitives */
++
++void fill(Band& b, Rect r, KDColor c, int alpha) {
++  Rect z = r.intersection(b.clip());
++  if (z.isEmpty() || alpha <= 0) {
++    return;
++  }
++  for (int y = z.y; y < z.bottom(); y++) {
++    KDColor* row = b.row(y);
++    if (alpha >= 256) {
++      for (int x = z.x; x < z.right(); x++) {
++        row[x] = c;
++      }
++    } else {
++      for (int x = z.x; x < z.right(); x++) {
++        row[x] = KDColor::Blend(c, row[x], static_cast<uint8_t>(alpha));
++      }
++    }
++  }
++}
++
++void frame(Band& b, Rect r, KDColor c, int alpha) {
++  fill(b, {r.x, r.y, r.w, 1}, c, alpha);
++  fill(b, {r.x, r.bottom() - 1, r.w, 1}, c, alpha);
++  fill(b, {r.x, r.y + 1, 1, r.h - 2}, c, alpha);
++  fill(b, {r.right() - 1, r.y + 1, 1, r.h - 2}, c, alpha);
++}
++
++void roundFill(Band& b, Rect r, int radius, KDColor c, int alpha) {
++  if (radius <= 0) {
++    return fill(b, r, c, alpha);
++  }
++  Rect z = r.intersection(b.clip());
++  if (z.isEmpty() || alpha <= 0) {
++    return;
++  }
++  for (int y = z.y; y < z.bottom(); y++) {
++    KDColor* row = b.row(y);
++    bool cornerRow = y < r.y + radius || y >= r.bottom() - radius;
++    for (int x = z.x; x < z.right(); x++) {
++      int a = alpha;
++      if (cornerRow) {
++        int cov = roundCoverage(r, radius, x, y);
++        if (cov == 0) {
++          continue;
++        }
++        a = (alpha * cov) >> 8;
++      }
++      blendPixel(row + x, c, a);
++    }
++  }
++}
++
++void roundFrame(Band& b, Rect r, int radius, KDColor c, int alpha) {
++  Rect z = r.intersection(b.clip());
++  if (z.isEmpty() || alpha <= 0) {
++    return;
++  }
++  Rect inner = {r.x + 1, r.y + 1, r.w - 2, r.h - 2};
++  int innerRadius = radius > 1 ? radius - 1 : 0;
++  for (int y = z.y; y < z.bottom(); y++) {
++    KDColor* row = b.row(y);
++    for (int x = z.x; x < z.right(); x++) {
++      int outer = roundCoverage(r, radius, x, y);
++      if (outer == 0) {
++        continue;
++      }
++      int in = inner.contains(x, y) ? roundCoverage(inner, innerRadius, x, y)
++                                    : 0;
++      int cov = outer - in;
++      if (cov > 0) {
++        blendPixel(row + x, c, (alpha * cov) >> 8);
++      }
++    }
++  }
++}
++
++void disc(Band& b, int cx, int cy, int radius, KDColor c, int alpha) {
++  roundFill(b, {cx - radius, cy - radius, 2 * radius + 1, 2 * radius + 1},
++            radius, c, alpha);
++}
++
++void bitmap(Band& b, const uint16_t* rows, int w, int h, int x, int y,
++            int scale, KDColor c, int alpha) {
++  Rect z = Rect{x, y, w * scale, h * scale}.intersection(b.clip());
++  if (z.isEmpty()) {
++    return;
++  }
++  for (int yy = z.y; yy < z.bottom(); yy++) {
++    uint16_t bits = rows[(yy - y) / scale];
++    KDColor* row = b.row(yy);
++    for (int xx = z.x; xx < z.right(); xx++) {
++      int bx = (xx - x) / scale;
++      if (bits & (0x8000 >> bx)) {
++        blendPixel(row + xx, c, alpha);
++      }
++    }
++  }
++}
++
++void gameIcon(Band& b, const Ion::ExternalApps::App& app, int x, int y,
++              int size) {
++  Rect z = Rect{x, y, size, size}.intersection(b.clip());
++  if (z.isEmpty()) {
++    return;
++  }
++  const uint8_t* data = app.iconData();
++  uint32_t dataSize = app.iconSize();
++  if (data == nullptr || dataSize == 0) {
++    roundFill(b, {x, y, size, size}, size / 5, rgb(0x7B2FF7));
++    return;
++  }
++  OMG::Memory::Decompress(data, reinterpret_cast<uint8_t*>(s_textBuffer),
++                          dataSize,
++                          k_nwaIconWidth * k_nwaIconHeight * sizeof(KDColor));
++  Rect r = {x, y, size, size};
++  int radius = size / 5;
++  for (int yy = z.y; yy < z.bottom(); yy++) {
++    KDColor* row = b.row(yy);
++    const KDColor* src =
++        s_textBuffer + ((yy - y) * k_nwaIconHeight / size) * k_nwaIconWidth;
++    for (int xx = z.x; xx < z.right(); xx++) {
++      int cov = roundCoverage(r, radius, xx, yy);
++      if (cov) {
++        blendPixel(row + xx, src[(xx - x) * k_nwaIconWidth / size], cov);
++      }
++    }
++  }
++}
++
++bool gameIconTexture(const Ion::ExternalApps::App& app, uint16_t* out, int w,
++                     int h) {
++  const uint8_t* data = app.iconData();
++  uint32_t dataSize = app.iconSize();
++  if (data == nullptr || dataSize == 0) {
++    return false;
++  }
++  OMG::Memory::Decompress(data, reinterpret_cast<uint8_t*>(s_textBuffer),
++                          dataSize,
++                          k_nwaIconWidth * k_nwaIconHeight * sizeof(KDColor));
++  for (int y = 0; y < h; y++) {
++    for (int x = 0; x < w; x++) {
++      out[y * w + x] = s_textBuffer[(y * k_nwaIconHeight / h) * k_nwaIconWidth +
++                                    x * k_nwaIconWidth / w];
++    }
++  }
++  return true;
++}
++
++/* ------------------------------------------------------------------ text */
++
++int glyphWidth(KDFont::Size font) { return KDFont::GlyphMaxWidth(font); }
++int glyphHeight(KDFont::Size font) { return KDFont::GlyphHeight(font); }
++
++int textWidth(const char* s, KDFont::Size font) {
++  char buffer[96];
++  s = decompose(s, buffer, sizeof(buffer));
++  return KDFont::Font(font)->stringSize(s).width();
++}
++
++void text(Band& b, const char* s, int x, int y, KDColor c, KDFont::Size font,
++          Align align, int maxWidth, int alpha) {
++  if (s == nullptr || s[0] == 0 || alpha <= 0) {
++    return;
++  }
++  char decomposed[96];
++  s = decompose(s, decomposed, sizeof(decomposed));
++  int h = glyphHeight(font);
++  if (y >= b.clip().bottom() || y + h <= b.clip().y) {
++    return;
++  }
++  constexpr int k_maxChars = 48;
++  char buffer[k_maxChars + 4];
++  int gw = glyphWidth(font);
++  int limit =
++      (maxWidth < k_textBufferWidth ? maxWidth : k_textBufferWidth) / gw;
++  int len = strlen(s);
++  if (limit <= 0) {
++    return;
++  }
++  if (len > limit || len > k_maxChars) {
++    int keep = limit < k_maxChars ? limit : k_maxChars;
++    while (keep > 0 && (static_cast<uint8_t>(s[keep]) & 0xC0) == 0x80) {
++      keep--;
++    }
++    memcpy(buffer, s, keep);
++    buffer[keep] = 0;
++    s = buffer;
++  }
++  int w = KDFont::Font(font)->stringSize(s).width();
++  if (w > k_textBufferWidth) {
++    w = k_textBufferWidth;
++  }
++  if (align == Align::Center) {
++    x -= w / 2;
++  } else if (align == Align::Right) {
++    x -= w;
++  }
++  Rect z = Rect{x, y, w, h}.intersection(b.clip());
++  if (z.isEmpty()) {
++    return;
++  }
++  rasterize(s, font);
++  for (int yy = z.y; yy < z.bottom(); yy++) {
++    KDColor* row = b.row(yy);
++    const KDColor* src = s_textBuffer + (yy - y) * k_textBufferWidth - x;
++    for (int xx = z.x; xx < z.right(); xx++) {
++      int a = src[xx].green();
++      if (a) {
++        a = a >= 252 ? 256 : a;
++        blendPixel(row + xx, c, (a * alpha) >> 8);
++      }
++    }
++  }
++}
++
++void outlinedText(Band& b, const char* s, int x, int y, KDColor c,
++                  KDFont::Size font, Align align) {
++  KDColor dark = rgb(0x0A0614);
++  text(b, s, x - 1, y, dark, font, align, k_screenWidth, 200);
++  text(b, s, x + 1, y, dark, font, align, k_screenWidth, 200);
++  text(b, s, x, y - 1, dark, font, align, k_screenWidth, 200);
++  text(b, s, x, y + 1, dark, font, align, k_screenWidth, 200);
++  text(b, s, x, y, c, font, align);
++}
++
++void bigText(Band& b, const char* s, int x, int y, int scale, KDColor c,
++             Align align, int alpha) {
++  if (s == nullptr || s[0] == 0 || alpha <= 0) {
++    return;
++  }
++  char decomposed[96];
++  s = decompose(s, decomposed, sizeof(decomposed));
++  KDSize size = KDFont::Font(KDFont::Size::Large)->stringSize(s);
++  int w = (size.width() < k_textBufferWidth ? size.width() : k_textBufferWidth);
++  int h = size.height() < k_textBufferHeight ? size.height()
++                                             : k_textBufferHeight;
++  if (align == Align::Center) {
++    x -= w * scale / 2;
++  } else if (align == Align::Right) {
++    x -= w * scale;
++  }
++  Rect z = Rect{x, y, w * scale, h * scale}.intersection(b.clip());
++  if (z.isEmpty()) {
++    return;
++  }
++  rasterize(s, KDFont::Size::Large);
++  for (int yy = z.y; yy < z.bottom(); yy++) {
++    KDColor* row = b.row(yy);
++    const KDColor* src = s_textBuffer + ((yy - y) / scale) * k_textBufferWidth;
++    for (int xx = z.x; xx < z.right(); xx++) {
++      int a = src[(xx - x) / scale].green();
++      if (a) {
++        a = a >= 252 ? 256 : a;
++        blendPixel(row + xx, c, (a * alpha) >> 8);
++      }
++    }
++  }
++}
++
++void glyphMask(const char* s, uint32_t* mask) {
++  for (int i = 0; i < 32; i++) {
++    mask[i] = 0;
++  }
++  if (s == nullptr || s[0] == 0) {
++    return;
++  }
++  char decomposed[48];
++  s = decompose(s, decomposed, sizeof(decomposed));
++  KDSize size = rasterize(s, KDFont::Size::Large);
++  int w = size.width(), h = size.height();
++  if (w <= 0 || h <= 0) {
++    return;
++  }
++  // Fit in 26 x 22 texels, centred, keeping the aspect ratio
++  float scale = 26.f / w;
++  if (22.f / h < scale) {
++    scale = 22.f / h;
++  }
++  int dw = static_cast<int>(w * scale), dh = static_cast<int>(h * scale);
++  int ox = (32 - dw) / 2, oy = (32 - dh) / 2 + 1;
++  for (int y = 0; y < dh; y++) {
++    int sy0 = static_cast<int>(y / scale), sy1 = static_cast<int>((y + 1) / scale);
++    for (int x = 0; x < dw; x++) {
++      int sx0 = static_cast<int>(x / scale), sx1 = static_cast<int>((x + 1) / scale);
++      int best = 0;
++      for (int sy = sy0; sy <= sy1 && sy < h; sy++) {
++        for (int sx = sx0; sx <= sx1 && sx < w; sx++) {
++          int g = s_textBuffer[sy * k_textBufferWidth + sx].green();
++          best = g > best ? g : best;
++        }
++      }
++      if (best > 140) {
++        mask[oy + y] |= 0x80000000u >> (ox + x);
++      }
++    }
++  }
++}
++
++}  // namespace Verse
++}  // namespace Home
+diff --git a/epsilon/apps/home/verse/gfx.h b/epsilon/apps/home/verse/gfx.h
+new file mode 100644
+index 0000000000..98ec08f89d
+--- /dev/null
++++ b/epsilon/apps/home/verse/gfx.h
+@@ -0,0 +1,100 @@
++#pragma once
++
++/* NUMVERSE drawing primitives.
++ *
++ * The screen is composed in RAM one horizontal band at a time (3D world,
++ * sprites, HUD, menus) and every finished band is pushed to the LCD in one
++ * go: no flicker, no tearing between layers. */
++
++#include <ion/display.h>
++#include <ion/external_apps.h>
++#include <kandinsky/color.h>
++#include <kandinsky/font.h>
++#include <stdint.h>
++
++namespace Home {
++namespace Verse {
++
++constexpr int k_screenWidth = Ion::Display::Width;
++constexpr int k_screenHeight = Ion::Display::Height;
++
++struct Rect {
++  int x, y, w, h;
++  int right() const { return x + w; }
++  int bottom() const { return y + h; }
++  bool isEmpty() const { return w <= 0 || h <= 0; }
++  bool contains(int px, int py) const {
++    return px >= x && py >= y && px < x + w && py < y + h;
++  }
++  Rect intersection(const Rect& o) const;
++};
++
++constexpr Rect k_screen = {0, 0, k_screenWidth, k_screenHeight};
++
++class Band {
++ public:
++  constexpr static int k_maxHeight = 12;
++  void begin(Rect area);
++  const Rect& area() const { return m_area; }
++  const Rect& clip() const { return m_clip; }
++  bool setClip(Rect r);
++  void resetClip() { m_clip = m_area; }
++  // Pointer to pixel (0, y) of the band, valid for x in [area.x, area.right)
++  KDColor* row(int y) const;
++  const KDColor* pixels() const;
++
++ private:
++  Rect m_area;
++  Rect m_clip;
++};
++
++enum class Align : uint8_t { Left, Center, Right };
++
++inline KDColor rgb(uint32_t c) { return KDColor::RGB24(c); }
++inline int clampi(int v, int lo, int hi) {
++  return v < lo ? lo : (v > hi ? hi : v);
++}
++inline void blendPixel(KDColor* p, KDColor c, int alpha) {
++  if (alpha >= 256) {
++    *p = c;
++  } else if (alpha > 0) {
++    *p = KDColor::Blend(c, *p, static_cast<uint8_t>(alpha > 255 ? 255 : alpha));
++  }
++}
++KDColor mix(KDColor a, KDColor b, int t256);  // t = 0 -> a, 256 -> b
++KDColor hsv(int hue, int sat, int val);       // hue 0..359, sat/val 0..255
++
++void fill(Band& b, Rect r, KDColor c, int alpha = 256);
++void roundFill(Band& b, Rect r, int radius, KDColor c, int alpha = 256);
++void roundFrame(Band& b, Rect r, int radius, KDColor c, int alpha = 256);
++void frame(Band& b, Rect r, KDColor c, int alpha = 256);
++void disc(Band& b, int cx, int cy, int radius, KDColor c, int alpha = 256);
++// 1-bit bitmap, rows of `w` bits (MSB first, w <= 16), scaled by `scale`
++void bitmap(Band& b, const uint16_t* rows, int w, int h, int x, int y,
++            int scale, KDColor c, int alpha = 256);
++// Icon of an external app (.nwa), scaled to size x size
++void gameIcon(Band& b, const Ion::ExternalApps::App& app, int x, int y,
++              int size);
++// Decompresses the icon of a .nwa into a w x h RGB565 texture
++bool gameIconTexture(const Ion::ExternalApps::App& app, uint16_t* out, int w,
++                     int h);
++// Text whose top-left corner is (x, y)
++void text(Band& b, const char* s, int x, int y, KDColor c,
++          KDFont::Size font = KDFont::Size::Small, Align align = Align::Left,
++          int maxWidth = k_screenWidth, int alpha = 256);
++// Text with a 1 px dark outline, readable over the 3D world
++void outlinedText(Band& b, const char* s, int x, int y, KDColor c,
++                  KDFont::Size font = KDFont::Size::Small,
++                  Align align = Align::Left);
++// Large-font text scaled up by an integer factor (titles, the logo)
++void bigText(Band& b, const char* s, int x, int y, int scale, KDColor c,
++             Align align = Align::Left, int alpha = 256);
++int textWidth(const char* s, KDFont::Size font = KDFont::Size::Small);
++int glyphWidth(KDFont::Size font = KDFont::Size::Small);
++int glyphHeight(KDFont::Size font = KDFont::Size::Small);
++/* Rasterizes `s` (centered) into a 32 x 32 1-bit mask (32 words), scaled up
++ * from the large font: the symbols drawn on the portals. */
++void glyphMask(const char* s, uint32_t* mask);
++
++}  // namespace Verse
++}  // namespace Home
+diff --git a/epsilon/apps/home/verse/shell.cpp b/epsilon/apps/home/verse/shell.cpp
+new file mode 100644
+index 0000000000..fd2bcbfc68
+--- /dev/null
++++ b/epsilon/apps/home/verse/shell.cpp
+@@ -0,0 +1,2148 @@
++#include "shell.h"
++
++#include <apps/apps_container.h>
++#include <apps/home/apps_layout.h>
++#include <apps/i18n.h>
++#include <ion.h>
++#include <ion/battery.h>
++#include <ion/display.h>
++#include <ion/keyboard.h>
++#include <ion/timing.h>
++#include <math.h>
++#include <string.h>
++#if !PLATFORM_DEVICE
++#include <stdio.h>
++#include <stdlib.h>
++#endif
++
++namespace Home {
++namespace Verse {
++
++namespace {
++
++namespace Events = Ion::Events;
++using Ion::Events::Event;
++using Ion::Keyboard::Key;
++using KDFont::Size::Large;
++using KDFont::Size::Small;
++
++constexpr float k_pi = 3.14159265f;
++
++/* ================================================================ state */
++
++enum class Mode : uint8_t { Boot, World, Teleport, Map, Credits, Warp };
++enum class Mood : uint8_t { Happy, Bored, Sleep, Scared, Love, Angry, Cool, Wow };
++
++struct Particle {
++  int16_t x, y;      // 1/4 pixel
++  int8_t vx, vy;     // 1/4 pixel per frame
++  uint8_t life;
++  uint8_t kind;      // 0 confetti, 1 bubble, 2 dust, 3 spark
++  uint16_t color;
++};
++constexpr int k_maxParticles = 40;
++
++struct Message {
++  const char* text;
++  Mood mood;
++  uint8_t priority;
++};
++constexpr int k_queueSize = 4;
++
++struct State {
++  bool initialized;
++  bool bootDone;
++  Mode mode;
++  Camera cam;
++  float vz;
++  float speed;
++  float bob;
++  float turn;
++  uint32_t forwardSince;
++  Theme theme;
++  bool rainbowUnlocked;
++  uint16_t coins;
++  uint32_t visited[k_mapHeight];
++  float ghostX, ghostY;
++  int8_t ghostTX, ghostTY, ghostPX, ghostPY;
++  uint32_t now, last, lastInput, modeStart, worldStart;
++  bool hud;
++  int8_t menuSelected, menuScroll;
++  // BIP
++  Message message;
++  uint32_t messageStart, messageEnd;
++  Message queue[k_queueSize];
++  uint8_t queueLength;
++  uint16_t seenPortals;
++  uint32_t lastBump, lastIdleTalk, lastFlicker;
++  uint32_t glitchUntil, partyUntil, flashUntil, ghostCooldown;
++  uint32_t warpStart;
++  const char* warpLabel;
++  int launches;
++  uint8_t jokeIndex;
++  int redrawAverage;
++  uint32_t random;
++  Particle particles[k_maxParticles];
++};
++
++State s;
++Engine* s_engine = nullptr;
++Item s_launch = k_noItem;
++
++/* The simulator's photo session (screenshots for the README) drives the
++ * clock and the keyboard itself. */
++bool s_fake = false;
++uint32_t s_fakeClock = 0;
++uint64_t s_fakeKeys = 0;
++
++uint32_t clockMs() {
++  return s_fake ? s_fakeClock : static_cast<uint32_t>(Ion::Timing::millis());
++}
++
++Ion::Keyboard::State scanKeys() {
++  return s_fake ? Ion::Keyboard::State(s_fakeKeys) : Ion::Keyboard::scan();
++}
++
++uint32_t rnd() {
++  s.random ^= s.random << 13;
++  s.random ^= s.random >> 17;
++  s.random ^= s.random << 5;
++  return s.random;
++}
++
++uint32_t hash(uint32_t x) {
++  x ^= x >> 16;
++  x *= 0x7feb352dU;
++  x ^= x >> 15;
++  x *= 0x846ca68bU;
++  x ^= x >> 16;
++  return x;
++}
++
++/* ================================================================ texts */
++
++constexpr const char* k_themeNames[k_numberOfThemes] = {
++    "SYNTHWAVE", "LIMINAL", "MATRIX", "ABYSSE", "CAHIER", "ARC-EN-CIEL"};
++
++constexpr const char* k_themeLines[k_numberOfThemes] = {
++    "Retour en 1986.\nMets tes lunettes.",
++    "On a fait un noclip...\n\xC3\x87""a sent la moquette humide.",
++    "Je vois des nombres partout.\nAh non, c'est normal.",
++    "Blub. Blub blub.\n(Je ne sais pas nager.)",
++    "On est dans ton cahier !\nNe rature rien.",
++    "TOUT EST ARC-EN-CIEL.\nJe n'ai aucun regret.",
++};
++
++constexpr const char* k_intro[] = {
++    "Salut ! Moi c'est BIP,\nl'\xC3\xA2me de ta calculatrice.",
++    "Les applis ? Dans les portails.\nFl\xC3\xA8""ches pour marcher, OK.",
++    "Retour = t\xC3\xA9l\xC3\xA9porteur.\nBo\xC3\xAEte \xC3\xA0 outils = carte.",
++    "Touches 1 \xC3\xA0 5 : change\nde r\xC3\xA9""alit\xC3\xA9. Essaie !",
++    "Et trouve les 10 pi\xC3\xA8""ces \xCF\x80.\nJe dis \xC3\xA7""a, je dis rien.",
++};
++
++constexpr const char* k_jokes[] = {
++    "Pourquoi 6 a peur de 7 ?\nParce que 7 8 9.",
++    "\xCF\x80 n'a pas de fin.\nComme tes devoirs.",
++    "0,999... = 1.\nJe ne discuterai pas.",
++    "Il y a 10 sortes de gens :\nceux qui lisent le binaire...",
++    "e^(i\xCF\x80) + 1 = 0.\nLa plus belle \xC3\xA9quation.",
++    "Une droite et un cercle\nse sont crois\xC3\xA9s. Tangent.",
++    "J'ai 1 Mo de RAM...\nenfin, presque.",
++    "Mon r\xC3\xAAve ? Diviser par 0.\nUne seule fois.",
++    "Un math\xC3\xA9maticien ne meurt pas.\nIl tend vers 0.",
++    "Je suis une calculatrice.\nJe compte sur toi.",
++};
++
++constexpr const char* k_idle[] = {
++    "Tu comptes rester plant\xC3\xA9\nl\xC3\xA0 ?",
++    "Je m'ennuie...\nCalcule-moi un truc.",
++    "Tu sais que tu peux sauter ?\nEXE. Essaie.",
++    "Le Glitch r\xC3\xB4""de dans le\nlabyrinthe. Brr.",
++    "J'ai compt\xC3\xA9 tous les pixels.\nIl y en a 76 800.",
++};
++
++constexpr const char* k_bump[] = {
++    "A\xC3\xAF""e ! C'est un mur,\npas un portail.",
++    "Les murs, c'est solide.\nComme les maths.",
++    "Tu essaies un noclip ?",
++    "Bonk.",
++    "Ce mur a une \xC3\xA9quation :\nx = toi.",
++};
++
++constexpr const char* k_back[] = {
++    "Re ! Alors, ces calculs ?",
++    "Te revoil\xC3\xA0 ! J'ai gard\xC3\xA9\nle monde au chaud.",
++    "Tu as trouv\xC3\xA9 x ?",
++    "Bienvenue \xC3\xA0 la maison.",
++    "Pendant ton absence, le\nGlitch a boug\xC3\xA9. Je crois.",
++};
++
++constexpr const char* k_coinLines[] = {
++    "Une pi\xC3\xA8""ce \xCF\x80 ! 3,14 points\nd'exp\xC3\xA9rience.",
++    "Ka-ching ! \xCF\x80 !",
++    "Encore une ! Tu es\nirrationnel(le).",
++    "Miam, des d\xC3\xA9""cimales.",
++};
++
++/* ================================================================ items */
++
++struct AppInfo {
++  I18n::Message name;
++  const char* symbol;
++  const char* line;
++};
++
++constexpr AppInfo k_appInfos[] = {
++    {I18n::Message::CalculApp, "\xE2\x88\x9A" "2", "Calculs : le classique.\nJe suis n\xC3\xA9 l\xC3\xA0-dedans."},
++    {I18n::Message::FunctionApp, "f(x)", "Les courbes, c'est mon\ntruc. Surtout les jolies."},
++    {I18n::Message::SolverApp, "x=?", "\xC3\x89quations : je trouve x,\ntu prends le cr\xC3\xA9""dit."},
++    {I18n::Message::StatsApp, "\xCE\xA3", "Statistiques : 87 % des\nstats sont invent\xC3\xA9""es."},
++    {I18n::Message::DistributionsApp, "P(X)", "Probabilit\xC3\xA9s : il y a\n50 % de chances que oui."},
++    {I18n::Message::SequenceApp, "u(n)", "Suites : u(n+1) = moi,\nen mieux."},
++    {I18n::Message::RegressionApp, "y=ax", "R\xC3\xA9gression : je trace\nla droite parfaite."},
++    {I18n::Message::InferenceApp, "p<\xCE\xB1", "Inf\xC3\xA9rence : hypoth\xC3\xA8se\nnulle ? Pas moi."},
++    {I18n::Message::FinanceApp, "%", "Finance : je ne te\npr\xC3\xAAterai pas d'argent."},
++    {I18n::Message::CodeApp, ">>>", "Python ! Le seul serpent\nqui ne mord pas."},
++    {I18n::Message::ElementsApp, "Fe", "Tableau p\xC3\xA9riodique.\nJe suis du silicium, moi."},
++    {I18n::Message::SettingsApp, "Cfg", "Param\xC3\xA8tres. Ne touche pas\n\xC3\xA0 ma luminosit\xC3\xA9."},
++};
++
++constexpr int k_maxBuiltin = k_appSlots;
++int16_t s_builtin[k_maxBuiltin];
++I18n::Message s_builtinName[k_maxBuiltin];
++int s_numberOfBuiltin = 0;
++int s_numberOfGames = 0;
++
++// Coins, in map order
++int8_t s_coinX[k_maxCoins], s_coinY[k_maxCoins];
++int s_numberOfCoins = 0;
++
++const AppInfo* appInfo(I18n::Message name) {
++  for (const AppInfo& info : k_appInfos) {
++    if (info.name == name) {
++      return &info;
++    }
++  }
++  return nullptr;
++}
++
++const char* builtinLabel(int slot) {
++  return I18n::translate(s_builtinName[slot]);
++}
++
++const char* gameLabel(int slot) {
++  return AppsContainer::sharedAppsContainer()->externalAppAtIndex(slot).name();
++}
++
++void buildItems() {
++  AppsContainer* container = AppsContainer::sharedAppsContainer();
++  int builtin = container->numberOfBuiltinApps();
++  s_numberOfBuiltin = 0;
++  for (int appIndex = 1;
++       appIndex < builtin && s_numberOfBuiltin < k_maxBuiltin; appIndex++) {
++    I18n::Message name = container
++                             ->appSnapshotAtIndex(PermutedAppSnapshotIndex(appIndex))
++                             ->descriptor()
++                             ->name();
++    s_builtin[s_numberOfBuiltin] = appIndex;
++    s_builtinName[s_numberOfBuiltin] = name;
++    s_numberOfBuiltin++;
++  }
++  s_numberOfGames = container->numberOfExternalApps();
++  if (s_numberOfGames > k_gameSlots) {
++    s_numberOfGames = k_gameSlots;
++  }
++  s_numberOfCoins = 0;
++  for (int y = 0; y < k_mapHeight; y++) {
++    for (int x = 0; x < k_mapWidth; x++) {
++      if (Engine::initialCell(x, y) == '*' && s_numberOfCoins < k_maxCoins) {
++        s_coinX[s_numberOfCoins] = x;
++        s_coinY[s_numberOfCoins] = y;
++        s_numberOfCoins++;
++      }
++    }
++  }
++}
++
++void setupEngine() {
++  s_engine->setup(s.theme, s.coins == (1u << s_numberOfCoins) - 1);
++  char fallback[4];
++  for (int i = 0; i < k_appSlots; i++) {
++    if (i >= s_numberOfBuiltin) {
++      s_engine->setAppSymbol(i, nullptr);
++      continue;
++    }
++    const AppInfo* info = appInfo(s_builtinName[i]);
++    if (info) {
++      s_engine->setAppSymbol(i, info->symbol);
++    } else {
++      const char* label = builtinLabel(i);
++      int n = 0;
++      while (n < 3 && label[n] && (static_cast<uint8_t>(label[n]) < 0x80)) {
++        fallback[n] = label[n];
++        n++;
++      }
++      fallback[n] = 0;
++      s_engine->setAppSymbol(i, fallback);
++    }
++  }
++  AppsContainer* container = AppsContainer::sharedAppsContainer();
++  for (int i = 0; i < k_gameSlots; i++) {
++    if (i < s_numberOfGames) {
++      Ion::ExternalApps::App app = container->externalAppAtIndex(i);
++      s_engine->setGame(i, &app);
++    } else {
++      s_engine->setGame(i, nullptr);
++    }
++  }
++}
++
++int coinCount() {
++  int n = 0;
++  for (int i = 0; i < s_numberOfCoins; i++) {
++    if (s.coins & (1 << i)) {
++      n++;
++    }
++  }
++  return n;
++}
++
++bool doorOpen() { return s_numberOfCoins > 0 && coinCount() == s_numberOfCoins; }
++
++int batteryPercent() {
++  float v = Ion::Battery::voltage();
++  int p = static_cast<int>((v - 3.6f) * 100.f / (4.15f - 3.6f));
++  return p < 0 ? 0 : (p > 100 ? 100 : p);
++}
++
++/* ================================================================== BIP */
++
++void showMessage(const Message& m) {
++  s.message = m;
++  s.messageStart = s.now;
++  s.messageEnd = s.now + strlen(m.text) * 28 + 2600;
++}
++
++void say(const char* text, Mood mood = Mood::Happy, uint8_t priority = 1) {
++  bool busy = s.message.text && s.now < s.messageEnd;
++  if (!busy || priority > s.message.priority) {
++    showMessage({text, mood, priority});
++    return;
++  }
++  if (s.queueLength < k_queueSize) {
++    s.queue[s.queueLength++] = {text, mood, priority};
++  }
++}
++
++void updateMessages() {
++  if (s.message.text && s.now >= s.messageEnd) {
++    s.message.text = nullptr;
++    if (s.queueLength > 0) {
++      showMessage(s.queue[0]);
++      for (int i = 1; i < s.queueLength; i++) {
++        s.queue[i - 1] = s.queue[i];
++      }
++      s.queueLength--;
++    }
++  }
++}
++
++Mood currentMood() {
++  if (s.message.text && s.now < s.messageEnd) {
++    return s.message.mood;
++  }
++  if (s.now < s.partyUntil) {
++    return Mood::Wow;
++  }
++  if (s.now < s.glitchUntil) {
++    return Mood::Scared;
++  }
++  uint32_t idle = s.now - s.lastInput;
++  if (idle > 40000) {
++    return Mood::Sleep;
++  }
++  if (idle > 14000) {
++    return Mood::Bored;
++  }
++  return s.theme == Theme::Synthwave ? Mood::Cool : Mood::Happy;
++}
++
++/* ============================================================ particles */
++
++void spawn(int x, int y, int vx, int vy, int life, int kind, KDColor color) {
++  for (Particle& p : s.particles) {
++    if (p.life == 0) {
++      p = {static_cast<int16_t>(x * 4), static_cast<int16_t>(y * 4),
++           static_cast<int8_t>(vx), static_cast<int8_t>(vy),
++           static_cast<uint8_t>(life), static_cast<uint8_t>(kind),
++           static_cast<uint16_t>(color)};
++      return;
++    }
++  }
++}
++
++void burst(int x, int y, int n) {
++  for (int i = 0; i < n; i++) {
++    spawn(x, y, static_cast<int>(rnd() % 25) - 12,
++          static_cast<int>(rnd() % 25) - 16, 25 + rnd() % 20, 0,
++          hsv(rnd() % 360, 200, 255));
++  }
++}
++
++void updateParticles() {
++  for (Particle& p : s.particles) {
++    if (p.life == 0) {
++      continue;
++    }
++    p.life--;
++    p.x += p.vx;
++    p.y += p.vy;
++    if (p.kind == 0 && (s.now & 1)) {
++      p.vy++;  // confetti fall
++    }
++    if (p.kind == 1) {
++      p.x += static_cast<int>(sinf((p.y + p.life * 9) * 0.02f) * 3.f);
++    }
++    if (p.y < -40 || p.y > (k_screenHeight + 10) * 4) {
++      p.life = 0;
++    }
++  }
++  // Ambient particles
++  if (s.mode == Mode::World || s.mode == Mode::Teleport) {
++    if (s.theme == Theme::Abyss && (rnd() & 3) == 0) {
++      spawn(rnd() % k_screenWidth, k_screenHeight, 0,
++            -4 - static_cast<int>(rnd() % 5), 120, 1, rgb(0xBFF4FF));
++    } else if (s.theme == Theme::Liminal && (rnd() & 7) == 0) {
++      spawn(rnd() % k_screenWidth, rnd() % k_screenHeight,
++            static_cast<int>(rnd() % 3) - 1, 1, 60, 2, rgb(0xFFF2B0));
++    }
++  }
++  if (s.now < s.partyUntil) {
++    for (int i = 0; i < 2; i++) {
++      spawn(rnd() % k_screenWidth, -2, static_cast<int>(rnd() % 7) - 3,
++            2 + rnd() % 4, 80, 0, hsv(rnd() % 360, 220, 255));
++    }
++  }
++}
++
++void renderParticles(Band& b) {
++  for (const Particle& p : s.particles) {
++    if (p.life == 0) {
++      continue;
++    }
++    int x = p.x / 4, y = p.y / 4;
++    KDColor c = KDColor::RGB16(p.color);
++    switch (p.kind) {
++      case 1:
++        roundFrame(b, {x - 2, y - 2, 5, 5}, 2, c, 200);
++        break;
++      case 2:
++        fill(b, {x, y, 1, 1}, c, 120);
++        break;
++      default:
++        fill(b, {x, y, (p.life & 4) ? 3 : 2, (p.life & 4) ? 2 : 3}, c);
++        break;
++    }
++  }
++}
++
++/* =============================================================== world */
++
++bool solidAt(float x, float y) {
++  return Engine::isSolid(s_engine->cell(static_cast<int>(x),
++                                        static_cast<int>(y)));
++}
++
++// Returns false if blocked
++bool tryMove(float dx, float dy) {
++  constexpr float r = 0.22f;
++  bool ok = true;
++  float nx = s.cam.x + dx;
++  float ex = nx + (dx > 0 ? r : -r);
++  if (dx != 0.f) {
++    if (!solidAt(ex, s.cam.y - r) && !solidAt(ex, s.cam.y + r)) {
++      s.cam.x = nx;
++    } else {
++      ok = false;
++    }
++  }
++  float ny = s.cam.y + dy;
++  float ey = ny + (dy > 0 ? r : -r);
++  if (dy != 0.f) {
++    if (!solidAt(s.cam.x - r, ey) && !solidAt(s.cam.x + r, ey)) {
++      s.cam.y = ny;
++    } else {
++      ok = false;
++    }
++  }
++  return ok;
++}
++
++void markVisited() {
++  int cx = static_cast<int>(s.cam.x), cy = static_cast<int>(s.cam.y);
++  for (int y = cy - 2; y <= cy + 2; y++) {
++    for (int x = cx - 2; x <= cx + 2; x++) {
++      if (x >= 0 && y >= 0 && x < k_mapWidth && y < k_mapHeight) {
++        s.visited[y] |= 1u << x;
++      }
++    }
++  }
++}
++
++void placeAt(float x, float y, float angle) {
++  s.cam.x = x;
++  s.cam.y = y;
++  s.cam.angle = angle;
++  s.cam.z = 0.5f;
++  s.vz = 0.f;
++  s.speed = 0.f;
++}
++
++void resetGhost() {
++  for (int y = 0; y < k_mapHeight; y++) {
++    for (int x = 0; x < k_mapWidth; x++) {
++      if (Engine::initialCell(x, y) == '&') {
++        s.ghostX = x + 0.5f;
++        s.ghostY = y + 0.5f;
++        s.ghostTX = s.ghostPX = x;
++        s.ghostTY = s.ghostPY = y;
++      }
++    }
++  }
++}
++
++void updateGhost(float dt) {
++  float tx = s.ghostTX + 0.5f, ty = s.ghostTY + 0.5f;
++  float dx = tx - s.ghostX, dy = ty - s.ghostY;
++  float d = sqrtf(dx * dx + dy * dy);
++  float step = 1.35f * dt;
++  if (d > step) {
++    s.ghostX += dx / d * step;
++    s.ghostY += dy / d * step;
++    return;
++  }
++  s.ghostX = tx;
++  s.ghostY = ty;
++  // Next cell: wander in the maze, hunt the player when close
++  constexpr int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
++  int options[4], n = 0;
++  for (int i = 0; i < 4; i++) {
++    int nx = s.ghostTX + dirs[i][0], ny = s.ghostTY + dirs[i][1];
++    if (ny < 11 || !Engine::isFloor(s_engine->cell(nx, ny))) {
++      continue;
++    }
++    if (nx == s.ghostPX && ny == s.ghostPY) {
++      continue;
++    }
++    options[n++] = i;
++  }
++  int choice = -1;
++  if (n == 0) {
++    choice = -2;  // dead end: go back
++  } else {
++    int px = static_cast<int>(s.cam.x), py = static_cast<int>(s.cam.y);
++    int dist = (px > s.ghostTX ? px - s.ghostTX : s.ghostTX - px) +
++               (py > s.ghostTY ? py - s.ghostTY : s.ghostTY - py);
++    if (py >= 11 && dist < 8 && (rnd() % 100) < 65) {
++      int best = 1000;
++      for (int k = 0; k < n; k++) {
++        int nx = s.ghostTX + dirs[options[k]][0];
++        int ny = s.ghostTY + dirs[options[k]][1];
++        int dd = (px > nx ? px - nx : nx - px) + (py > ny ? py - ny : ny - py);
++        if (dd < best) {
++          best = dd;
++          choice = options[k];
++        }
++      }
++    } else {
++      choice = options[rnd() % n];
++    }
++  }
++  int nx, ny;
++  if (choice == -2) {
++    nx = s.ghostPX;
++    ny = s.ghostPY;
++  } else {
++    nx = s.ghostTX + dirs[choice][0];
++    ny = s.ghostTY + dirs[choice][1];
++  }
++  s.ghostPX = s.ghostTX;
++  s.ghostPY = s.ghostTY;
++  s.ghostTX = nx;
++  s.ghostTY = ny;
++}
++
++void setTheme(Theme t, bool talk) {
++  if (t == Theme::Rainbow && !s.rainbowUnlocked) {
++    say("Cette r\xC3\xA9""alit\xC3\xA9 est verrouill\xC3\xA9""e.\nTrouve le troph\xC3\xA9""e \xCF\x80...",
++        Mood::Angry, 2);
++    return;
++  }
++  s.theme = t;
++  s_engine->setTheme(t);
++  s_engine->setWave(t == Theme::Abyss);
++  s.flashUntil = s.now + 250;
++  if (talk) {
++    // A new reality: forget what BIP was about to say about the old one
++    s.queueLength = 0;
++    showMessage({k_themeLines[static_cast<int>(t)],
++                 t == Theme::Liminal ? Mood::Scared : Mood::Happy, 2});
++  }
++}
++
++void startWorld(bool intro) {
++  s.mode = Mode::World;
++  s.modeStart = s.now;
++  s.worldStart = s.now;
++  s.bootDone = true;
++  s.lastInput = s.now;
++  if (intro) {
++    for (const char* line : k_intro) {
++      say(line, Mood::Happy, 1);
++    }
++  }
++}
++
++void interact();
++
++void updateWorld(float dt, const Ion::Keyboard::State& keys) {
++  // Intro spin after the boot
++  uint32_t sinceStart = s.now - s.worldStart;
++  bool left = keys.keyDown(Key::Left), right = keys.keyDown(Key::Right);
++  bool up = keys.keyDown(Key::Up), down = keys.keyDown(Key::Down);
++  if (left || right || up || down) {
++    s.lastInput = s.now;
++  }
++  float targetTurn = (right ? 1.f : 0.f) - (left ? 1.f : 0.f);
++  s.turn += (targetTurn - s.turn) * (dt * 12.f > 1.f ? 1.f : dt * 12.f);
++  s.cam.angle += s.turn * 2.5f * dt;
++  if (s.cam.angle > 2 * k_pi) {
++    s.cam.angle -= 2 * k_pi;
++  } else if (s.cam.angle < 0) {
++    s.cam.angle += 2 * k_pi;
++  }
++  float target = 0.f;
++  if (up) {
++    if (s.forwardSince == 0) {
++      s.forwardSince = s.now;
++    }
++    target = (s.now - s.forwardSince > 1300) ? 4.2f : 2.6f;
++  } else {
++    s.forwardSince = 0;
++    if (down) {
++      target = -1.8f;
++    }
++  }
++  s.speed += (target - s.speed) * (dt * 8.f > 1.f ? 1.f : dt * 8.f);
++  if (fabsf(s.speed) > 0.02f) {
++    float dx = cosf(s.cam.angle) * s.speed * dt;
++    float dy = sinf(s.cam.angle) * s.speed * dt;
++    if (!tryMove(dx, dy) && (up || down) && s.now - s.lastBump > 2500) {
++      s.lastBump = s.now;
++      say(k_bump[rnd() % (sizeof(k_bump) / sizeof(k_bump[0]))], Mood::Angry,
++          1);
++    }
++    s.bob += fabsf(s.speed) * dt * 9.f;
++  }
++  // Jump and head bob
++  if (s.vz != 0.f || s.cam.z > 0.5f + 0.03f) {
++    s.cam.z += s.vz * dt;
++    s.vz -= 7.f * dt;
++    if (s.cam.z <= 0.5f) {
++      s.cam.z = 0.5f;
++      s.vz = 0.f;
++    }
++  } else {
++    s.cam.z = 0.5f + (fabsf(s.speed) > 0.1f ? sinf(s.bob) * 0.018f : 0.f);
++  }
++  if (sinceStart < 1600 && s.launches == 0 && s.message.text) {
++    // Fall from the sky while spinning
++    float t = sinceStart / 1600.f;
++    s.cam.z = 0.5f + 0.45f * (1.f - t) * (1.f - t);
++  }
++  markVisited();
++
++  // Coins
++  for (int i = 0; i < s_numberOfCoins; i++) {
++    if (s.coins & (1 << i)) {
++      continue;
++    }
++    float dx = s_coinX[i] + 0.5f - s.cam.x, dy = s_coinY[i] + 0.5f - s.cam.y;
++    if (dx * dx + dy * dy < 0.2f) {
++      s.coins |= 1 << i;
++      burst(k_screenWidth / 2, k_screenHeight / 2, 18);
++      if (doorOpen()) {
++        s_engine->setDoorOpen(true);
++        s.partyUntil = s.now + 4000;
++        s.flashUntil = s.now + 400;
++        say("LES 10 \xCF\x80 !!! La porte\nsecr\xC3\xA8te s'est ouverte !", Mood::Love,
++            3);
++        say("Elle est \xC3\xA0 l'ouest du\nlabyrinthe. Vas-y !", Mood::Wow, 2);
++      } else {
++        say(k_coinLines[rnd() % (sizeof(k_coinLines) / sizeof(k_coinLines[0]))],
++            Mood::Love, 2);
++      }
++    }
++  }
++
++  // The Glitch
++  updateGhost(dt);
++  float gx = s.ghostX - s.cam.x, gy = s.ghostY - s.cam.y;
++  if (gx * gx + gy * gy < 0.25f && s.now > s.ghostCooldown) {
++    s.glitchUntil = s.now + 1100;
++    s.ghostCooldown = s.now + 6000;
++    say("AAAAH LE GLITCH !!!\nOn est o\xC3\xB9 l\xC3\xA0 ?!", Mood::Scared, 3);
++    placeAt(3.5f, 5.5f, 0.f);
++  }
++
++  // Liminal lights flicker
++  if (s.theme == Theme::Liminal) {
++    if (s.now - s.lastFlicker > 90) {
++      s.lastFlicker = s.now;
++      s_engine->setFlicker((rnd() % 40) == 0 ? 4 : 0);
++    }
++  } else {
++    s_engine->setFlicker(0);
++  }
++
++  // BIP comments what you look at, once
++  const Target& t = s_engine->target();
++  if (t.cell >= 'a' && t.cell <= 'n' && t.distance < 2.5f) {
++    int slot = t.cell - 'a';
++    if (slot < s_numberOfBuiltin && !(s.seenPortals & (1 << slot))) {
++      s.seenPortals |= 1 << slot;
++      const AppInfo* info = appInfo(s_builtinName[slot]);
++      if (info) {
++        say(info->line, Mood::Happy, 1);
++      }
++    }
++  }
++
++  // Idle talk
++  uint32_t idle = s.now - s.lastInput;
++  if (idle > 14000 && idle < 40000 && s.now - s.lastIdleTalk > 15000 &&
++      !s.message.text) {
++    s.lastIdleTalk = s.now;
++    say(k_idle[rnd() % (sizeof(k_idle) / sizeof(k_idle[0]))], Mood::Bored, 1);
++  }
++  if (batteryPercent() < 12 && s.now - s.lastIdleTalk > 60000) {
++    s.lastIdleTalk = s.now;
++    say("J'ai faim... de volts.\nBranche-moi vite.", Mood::Bored, 1);
++  }
++}
++
++/* ============================================================== launch */
++
++void warpTo(Item item, const char* label) {
++  /* A short dimensional jump before opening the app. The screen is drawn
++   * directly here: the app is opened right after. */
++  s.mode = Mode::Warp;
++  s.warpStart = clockMs();
++  s.warpLabel = label;
++  Band band;
++  while (!s_fake) {
++    s.now = clockMs();
++    if (s.now - s.warpStart > 750) {
++      break;
++    }
++    for (int y = 0; y < k_screenHeight; y += Band::k_maxHeight) {
++      Rect area = {0, y, k_screenWidth, Band::k_maxHeight};
++      band.begin(area);
++      Shell::render(band);
++      Ion::Display::pushRect(KDRect(area.x, area.y, area.w, area.h),
++                             band.pixels());
++    }
++  }
++  s.mode = Mode::World;
++  s.launches++;
++  s_launch = item;
++}
++
++void openSlotApp(int slot) {
++  warpTo({Item::Kind::Builtin, s_builtin[slot]}, builtinLabel(slot));
++}
++
++void openGame(int slot) {
++  warpTo({Item::Kind::External, static_cast<int16_t>(slot)}, gameLabel(slot));
++}
++
++const char* targetLabel(const Target& t, bool* openable) {
++  *openable = false;
++  if (t.distance > 2.3f) {
++    return nullptr;
++  }
++  if (t.cell >= 'a' && t.cell <= 'n') {
++    int slot = t.cell - 'a';
++    if (slot < s_numberOfBuiltin) {
++      *openable = true;
++      return builtinLabel(slot);
++    }
++    return nullptr;
++  }
++  if (t.cell >= 'A' && t.cell <= 'H') {
++    int slot = t.cell - 'A';
++    if (slot < s_numberOfGames) {
++      *openable = true;
++      return gameLabel(slot);
++    }
++    return "Borne vide";
++  }
++  switch (t.cell) {
++    case 'M':
++      return "Monolithe";
++    case 'T':
++      *openable = true;
++      return "Troph\xC3\xA9""e \xCF\x80";
++    case '=':
++      return "Porte secr\xC3\xA8te";
++    default:
++      return nullptr;
++  }
++}
++
++void interact() {
++  const Target& t = s_engine->target();
++  if (t.distance > 2.3f) {
++    say(k_bump[rnd() % 3], Mood::Happy, 1);
++    return;
++  }
++  if (t.cell >= 'a' && t.cell <= 'n') {
++    int slot = t.cell - 'a';
++    if (slot < s_numberOfBuiltin) {
++      openSlotApp(slot);
++    } else {
++      say("Ce portail est \xC3\xA9teint.\nIl attend une appli.", Mood::Bored, 1);
++    }
++    return;
++  }
++  if (t.cell >= 'A' && t.cell <= 'H') {
++    int slot = t.cell - 'A';
++    if (slot < s_numberOfGames) {
++      openGame(slot);
++    } else {
++      say("Borne vide. Ajoute des jeux\n.nwa avec l'installateur !",
++          Mood::Bored, 2);
++    }
++    return;
++  }
++  switch (t.cell) {
++    case 'M':
++      s.partyUntil = s.now + 2500;
++      say("NUMVERSE v1.0\nLa r\xC3\xA9""alit\xC3\xA9 est en b\xC3\xAAta.", Mood::Wow, 2);
++      break;
++    case '=': {
++      static char buffer[48];
++      int n = coinCount();
++      strlcpy(buffer, "Ferm\xC3\xA9""e. Il faut 10 \xCF\x80.\nTu en as ", sizeof(buffer));
++      size_t l = strlen(buffer);
++      if (n >= 10) {
++        buffer[l++] = '0' + n / 10;
++      }
++      buffer[l++] = '0' + n % 10;
++      buffer[l++] = '.';
++      buffer[l] = 0;
++      say(buffer, Mood::Angry, 2);
++      break;
++    }
++    case 'T':
++      s.mode = Mode::Credits;
++      s.modeStart = s.now;
++      if (!s.rainbowUnlocked) {
++        s.rainbowUnlocked = true;
++      }
++      break;
++    default:
++      say(k_bump[rnd() % 3], Mood::Angry, 1);
++      break;
++  }
++}
++
++/* ============================================================ teleport */
++
++struct Entry {
++  enum Kind : uint8_t { Place, App, Game } kind;
++  int8_t index;
++};
++
++struct Place {
++  const char* name;
++  float x, y, angle;
++};
++
++constexpr Place k_places[] = {
++    {"Hall des portails", 3.5f, 5.5f, 0.f},
++    {"Salle d'arcade", 18.5f, 6.5f, -1.5708f},
++    {"Labyrinthe du Glitch", 19.5f, 11.5f, 1.5708f},
++    {"Salle secr\xC3\xA8te", 3.5f, 16.5f, -1.5708f},
++};
++
++int entryCount() {
++  return (doorOpen() ? 4 : 3) + s_numberOfBuiltin + s_numberOfGames;
++}
++
++Entry entryAt(int i) {
++  int places = doorOpen() ? 4 : 3;
++  if (i < places) {
++    return {Entry::Place, static_cast<int8_t>(i)};
++  }
++  i -= places;
++  if (i < s_numberOfBuiltin) {
++    return {Entry::App, static_cast<int8_t>(i)};
++  }
++  return {Entry::Game, static_cast<int8_t>(i - s_numberOfBuiltin)};
++}
++
++const char* entryLabel(Entry e) {
++  switch (e.kind) {
++    case Entry::Place:
++      return k_places[e.index].name;
++    case Entry::App:
++      return builtinLabel(e.index);
++    default:
++      return gameLabel(e.index);
++  }
++}
++
++constexpr int k_menuRows = 8;
++
++void activateEntry(Entry e) {
++  switch (e.kind) {
++    case Entry::Place: {
++      const Place& p = k_places[e.index];
++      placeAt(p.x, p.y, p.angle < 0 ? p.angle + 2 * k_pi : p.angle);
++      s.mode = Mode::World;
++      s.flashUntil = s.now + 300;
++      s.glitchUntil = s.now + 250;
++      say("Fzzzt ! T\xC3\xA9l\xC3\xA9portation r\xC3\xA9ussie.\nTous tes atomes sont l\xC3\xA0.",
++          Mood::Wow, 1);
++      break;
++    }
++    case Entry::App:
++      s.mode = Mode::World;
++      openSlotApp(e.index);
++      break;
++    default:
++      s.mode = Mode::World;
++      openGame(e.index);
++      break;
++  }
++}
++
++/* ============================================================== render */
++
++void renderBoot(Band& b) {
++  uint32_t e = s.now - s.modeStart;
++  fill(b, b.area(), rgb(0x000000));
++  // CRT power on
++  if (e < 600) {
++    if (e < 250) {
++      int w = static_cast<int>(e * k_screenWidth / 250);
++      fill(b, {k_screenWidth / 2 - w / 2, k_screenHeight / 2 - 1, w, 2},
++           rgb(0xFFFFFF));
++    } else if (e < 450) {
++      int h = static_cast<int>((e - 250) * k_screenHeight / 200);
++      fill(b, {0, k_screenHeight / 2 - h / 2, k_screenWidth, h},
++           rgb(0xE8F4FF));
++    } else {
++      fill(b, b.area(), rgb(0xFFFFFF), static_cast<int>((600 - e) * 256 / 150));
++    }
++    return;
++  }
++  struct Line {
++    const char* text;
++    const char* status;
++    uint32_t color;
++  };
++  constexpr Line k_lines[] = {
++      {"NUMVERSE BIOS 1.0  (c) BIP Corp.", nullptr, 0},
++      {"CPU : ARM Cortex-M7 @ 216 MHz", "OK", 0x3BFF7A},
++      {"Clavier : 46 touches", "OK", 0x3BFF7A},
++      {"\xC3\x89""cran : 320x240, 65 536 couleurs", "OK", 0x3BFF7A},
++      {"Moteur 3D : 320 rayons / image", "OK", 0x3BFF7A},
++      {"Ennui de l'utilisateur", "\xC3\x89LEV\xC3\x89", 0xFFB020},
++      {"Chargement de reality.dll", "\xC3\x89""CHEC", 0xFF3050},
++      {"> Cr\xC3\xA9""ation d'un monde de secours", nullptr, 0},
++  };
++  constexpr int k_lineCount = sizeof(k_lines) / sizeof(k_lines[0]);
++  constexpr uint32_t k_lineDelay = 300;
++  uint32_t textEnd = 600 + k_lineCount * k_lineDelay;
++  if (e < textEnd + 900) {
++    for (int i = 0; i < k_lineCount; i++) {
++      uint32_t start = 600 + i * k_lineDelay;
++      if (e < start) {
++        break;
++      }
++      int y = 12 + i * 18;
++      char buffer[48];
++      int chars = static_cast<int>((e - start) / 9);
++      int len = strlen(k_lines[i].text);
++      if (chars > len) {
++        chars = len;
++      }
++      memcpy(buffer, k_lines[i].text, chars);
++      buffer[chars] = 0;
++      text(b, buffer, 8, y, i == 0 ? rgb(0xFFFFFF) : rgb(0xB8C4D0));
++      if (k_lines[i].status && chars == len && e > start + 220) {
++        bool blink = k_lines[i].color == 0xFF3050 && ((e / 200) & 1);
++        if (!blink) {
++          text(b, k_lines[i].status, k_screenWidth - 8, y,
++               rgb(k_lines[i].color), Small, Align::Right);
++        }
++      }
++    }
++    // Progress bar with glitches
++    if (e > textEnd) {
++      int p = static_cast<int>((e - textEnd) * 100 / 800);
++      if (p > 100) {
++        p = 100;
++      }
++      Rect bar = {8, 170, k_screenWidth - 16, 14};
++      frame(b, bar, rgb(0x3BFF7A));
++      fill(b, {bar.x + 2, bar.y + 2, (bar.w - 4) * p / 100, bar.h - 4},
++           rgb(0x3BFF7A));
++      for (int i = 0; i < 6; i++) {
++        uint32_t h = hash(i + (e / 70) * 7);
++        if ((h & 3) == 0) {
++          fill(b, {static_cast<int>(h % 300), 190 + static_cast<int>((h >> 9) % 40),
++                   20 + static_cast<int>((h >> 4) % 40), 3},
++               hsv(h % 360, 255, 255));
++        }
++      }
++      char pct[8];
++      int l = 0;
++      if (p >= 100) {
++        pct[l++] = '1';
++      }
++      if (p >= 10) {
++        pct[l++] = '0' + (p / 10) % 10;
++      }
++      pct[l++] = '0' + p % 10;
++      pct[l++] = ' ';
++      pct[l++] = '%';
++      pct[l] = 0;
++      text(b, pct, k_screenWidth / 2, 152, rgb(0x3BFF7A), Small, Align::Center);
++    }
++    // Scanlines
++    for (int y = b.area().y; y < b.area().bottom(); y++) {
++      if ((y & 1) == 0) {
++        fill(b, {0, y, k_screenWidth, 1}, rgb(0x000000), 70);
++      }
++    }
++    return;
++  }
++  // Logo with chromatic aberration
++  uint32_t le = e - textEnd - 900;
++  int shake = le < 400 ? static_cast<int>(hash(le / 40) % 7) - 3 : 0;
++  int cx = k_screenWidth / 2, y = 70;
++  for (int yy = b.area().y; yy < b.area().bottom(); yy++) {
++    // Synthwave grid floor below the logo
++    if (yy > 150) {
++      int d = yy - 150;
++      KDColor c = mix(rgb(0x14002A), rgb(0x000000), 0);
++      fill(b, {0, yy, k_screenWidth, 1}, c);
++      int z = 2000 / (d + 4);
++      if (((z + static_cast<int>(le / 30)) % 8) == 0) {
++        fill(b, {0, yy, k_screenWidth, 1}, rgb(0xFF2FD0), 200);
++      }
++      for (int k = -12; k <= 12; k++) {
++        int x = cx + k * (d + 4) * 3;
++        fill(b, {x, yy, 1, 1}, rgb(0xFF2FD0), 200);
++      }
++    }
++  }
++  bigText(b, "NUMVERSE", cx - 3 + shake, y, 3, rgb(0x00F0FF), Align::Center, 200);
++  bigText(b, "NUMVERSE", cx + 3 - shake, y, 3, rgb(0xFF2E88), Align::Center, 200);
++  bigText(b, "NUMVERSE", cx, y, 3, rgb(0xFFFFFF), Align::Center);
++  text(b, "ta calculatrice est un monde", cx, y + 60, rgb(0xFFB3E6), Small,
++       Align::Center);
++  if ((le / 450) & 1) {
++    text(b, "OK pour entrer", cx, 200, rgb(0xFFFFFF), Small, Align::Center);
++  }
++  if (le < 200) {
++    fill(b, b.area(), rgb(0xFFFFFF), static_cast<int>((200 - le) * 256 / 200));
++  }
++}
++
++void renderWarp(Band& b) {
++  uint32_t e = s.now - s.warpStart;
++  const Rect& a = b.area();
++  KDColor neon = s_engine->neonColor();
++  for (int y = a.y; y < a.bottom(); y++) {
++    KDColor* row = b.row(y);
++    int dy = y - k_screenHeight / 2;
++    dy = dy < 0 ? -dy : dy;
++    for (int x = 0; x < k_screenWidth; x++) {
++      int dx = x - k_screenWidth / 2;
++      dx = dx < 0 ? -dx : dx;
++      int d = dx > dy ? dx + dy / 2 : dy + dx / 2;
++      int ring = ((d >> 3) - static_cast<int>(e / 18)) & 7;
++      int bright = d * 256 / 200;
++      if (bright > 256) {
++        bright = 256;
++      }
++      KDColor c = hsv(250 + ring * 14 + static_cast<int>(e / 6), 200,
++                      40 + bright * 215 / 256);
++      row[x] = ring == 0 ? mix(c, neon, 160) : c;
++    }
++  }
++  if (s.warpLabel) {
++    outlinedText(b, "SAUT DIMENSIONNEL", k_screenWidth / 2, 92, rgb(0xFFFFFF),
++                 Small, Align::Center);
++    outlinedText(b, s.warpLabel, k_screenWidth / 2, 112, rgb(0xFFFFFF), Large,
++                 Align::Center);
++  }
++  if (e > 550) {
++    fill(b, a, rgb(0xFFFFFF), static_cast<int>((e - 550) * 256 / 200));
++  }
++}
++
++void drawBip(Band& b) {
++  Mood mood = currentMood();
++  int x0 = 6, y0 = 190;
++  if (mood == Mood::Scared) {
++    x0 += static_cast<int>(hash(s.now / 40) % 5) - 2;
++  }
++  constexpr int S = 44;
++  KDColor neon = s_engine->neonColor();
++  if (mood == Mood::Wow || mood == Mood::Love) {
++    neon = hsv(s.now / 4, 200, 255);
++  }
++  // Antenna
++  fill(b, {x0 + S / 2, y0 - 7, 2, 7}, rgb(0x8A8AA0));
++  disc(b, x0 + S / 2 + 1, y0 - 8, 2,
++       (s.now / 500) & 1 ? rgb(0xFF3050) : neon);
++  roundFill(b, {x0, y0, S, S}, 9, rgb(0x150C2A), 235);
++  roundFrame(b, {x0, y0, S, S}, 9, neon);
++  int ex[2] = {x0 + 14, x0 + 30};
++  int ey = y0 + 17;
++  int look = static_cast<int>(s.turn * 3.f);
++  KDColor eye = rgb(0xEFFFFF);
++  bool blink = (s.now % 4200) < 130;
++  for (int i = 0; i < 2; i++) {
++    int cx = ex[i] + look;
++    switch (mood) {
++      case Mood::Sleep:
++        fill(b, {cx - 4, ey + 1, 9, 2}, eye);
++        break;
++      case Mood::Bored:
++        fill(b, {cx - 3, ey, 7, 4}, eye);
++        fill(b, {cx - 4, ey - 1, 9, 1}, neon);
++        break;
++      case Mood::Scared:
++        disc(b, cx, ey, 6, eye);
++        disc(b, cx + (i ? -1 : 1), ey + 1, 2, rgb(0x000000));
++        break;
++      case Mood::Love: {
++        static constexpr uint16_t heart[6] = {0x6C00, 0xFE00, 0xFE00,
++                                              0x7C00, 0x3800, 0x1000};
++        bitmap(b, heart, 7, 6, cx - 3, ey - 3, 1, rgb(0xFF3C78));
++        break;
++      }
++      case Mood::Wow:
++        disc(b, cx, ey, 4, hsv(s.now / 3 + i * 120, 200, 255));
++        disc(b, cx, ey, 1, rgb(0xFFFFFF));
++        break;
++      case Mood::Angry:
++        roundFill(b, {cx - 3, ey - 2, 7, 8}, 3, eye);
++        for (int k = 0; k < 7; k++) {
++          int yy = ey - 6 + (i ? 6 - k : k) / 2;
++          fill(b, {cx - 3 + k, yy, 1, 2}, rgb(0xFF3050));
++        }
++        break;
++      default:
++        if (blink) {
++          fill(b, {cx - 3, ey, 7, 2}, eye);
++        } else {
++          roundFill(b, {cx - 3, ey - 5, 7, 10}, 3, eye);
++        }
++        break;
++    }
++  }
++  if (mood == Mood::Cool) {
++    roundFill(b, {x0 + 6, ey - 5, S - 12, 9}, 3, rgb(0x050505));
++    fill(b, {x0 + 9, ey - 3, 6, 1}, rgb(0xFF6AD5));
++    fill(b, {x0 + 25, ey - 3, 6, 1}, rgb(0x6AF3FF));
++  }
++  // Mouth
++  int mx = x0 + S / 2, my = y0 + 32;
++  bool talking = s.message.text && s.now < s.messageEnd &&
++                 (s.now - s.messageStart) < strlen(s.message.text) * 28;
++  if (talking && ((s.now / 90) & 1)) {
++    roundFill(b, {mx - 4, my - 2, 9, 6}, 2, rgb(0xFF5A7A));
++  } else {
++    switch (mood) {
++      case Mood::Bored:
++      case Mood::Sleep:
++        fill(b, {mx - 4, my, 9, 2}, eye);
++        break;
++      case Mood::Scared:
++        roundFrame(b, {mx - 3, my - 2, 7, 7}, 3, eye);
++        break;
++      case Mood::Angry:
++        for (int dx = -5; dx <= 5; dx++) {
++          fill(b, {mx + dx, my + 3 - (25 - dx * dx) / 9, 1, 2}, eye);
++        }
++        break;
++      default:
++        for (int dx = -5; dx <= 5; dx++) {
++          fill(b, {mx + dx, my + (25 - dx * dx) / 9 - 1, 1, 2}, eye);
++        }
++        break;
++    }
++  }
++  if (mood == Mood::Sleep) {
++    int t = static_cast<int>((s.now / 60) % 30);
++    text(b, "z", x0 + S + 2 + t / 3, y0 - t, rgb(0xFFFFFF), Small,
++         Align::Left, k_screenWidth, 255 - t * 8);
++    text(b, "Z", x0 + S + 8 + t / 4, y0 - 12 - t / 2, rgb(0xFFFFFF), Small,
++         Align::Left, k_screenWidth, 200 - t * 6);
++  }
++}
++
++void drawBubble(Band& b) {
++  if (!s.message.text || s.now >= s.messageEnd) {
++    return;
++  }
++  const char* m = s.message.text;
++  int visible = static_cast<int>((s.now - s.messageStart) / 28);
++  // Split in up to two lines
++  char lines[2][44];
++  int n = 0, l = 0, count = 0;
++  lines[0][0] = lines[1][0] = 0;
++  for (const char* p = m; *p && n < 2; p++) {
++    if (count >= visible && (static_cast<uint8_t>(*p) & 0xC0) != 0x80) {
++      break;
++    }
++    if (*p == '\n') {
++      lines[n][l] = 0;
++      n++;
++      l = 0;
++      continue;
++    }
++    if (l < 43) {
++      lines[n][l++] = *p;
++      lines[n][l] = 0;
++    }
++    count++;
++  }
++  int w1 = textWidth(lines[0]), w2 = textWidth(lines[1]);
++  // Width from the whole message, so the bubble does not grow while typing
++  int full = 0, cur = 0;
++  char tmp[44];
++  int tl = 0;
++  for (const char* p = m;; p++) {
++    if (*p == '\n' || *p == 0) {
++      tmp[tl] = 0;
++      cur = textWidth(tmp);
++      full = cur > full ? cur : full;
++      tl = 0;
++      if (*p == 0) {
++        break;
++      }
++      continue;
++    }
++    if (tl < 43) {
++      tmp[tl++] = *p;
++    }
++  }
++  (void)w1;
++  (void)w2;
++  bool two = strchr(m, '\n') != nullptr;
++  int h = two ? 36 : 22;
++  Rect r = {58, 232 - h, full + 16, h};
++  if (r.right() > k_screenWidth - 4) {
++    r.w = k_screenWidth - 4 - r.x;
++  }
++  roundFill(b, r, 8, rgb(0xFFFFFF), 240);
++  // Tail
++  for (int i = 0; i < 6; i++) {
++    fill(b, {r.x - 6 + i, r.bottom() - 12 + i / 2, 1, 6 - i}, rgb(0xFFFFFF),
++         240);
++  }
++  text(b, lines[0], r.x + 8, r.y + 4, rgb(0x1A1030));
++  if (two) {
++    text(b, lines[1], r.x + 8, r.y + 18, rgb(0x1A1030));
++  }
++}
++
++void drawCompass(Band& b) {
++  constexpr int cx = k_screenWidth / 2, w = 136, y = 4;
++  if (!b.setClip({cx - w / 2, y, w, 16})) {
++    b.resetClip();
++    return;
++  }
++  roundFill(b, {cx - w / 2, y, w, 16}, 8, rgb(0x000000), 120);
++  constexpr const char* names[8] = {"E", "SE", "S", "SO", "O", "NO", "N", "NE"};
++  for (int i = 0; i < 8; i++) {
++    float a = i * k_pi / 4.f - s.cam.angle;
++    while (a > k_pi) {
++      a -= 2 * k_pi;
++    }
++    while (a < -k_pi) {
++      a += 2 * k_pi;
++    }
++    int x = cx + static_cast<int>(a * 84.f / (k_pi / 2.f));
++    bool major = (i % 2) == 0;
++    text(b, names[i], x, y + 1, major ? rgb(0xFFFFFF) : rgb(0x9A9AB0), Small,
++         Align::Center);
++  }
++  fill(b, {cx, y, 1, 3}, s_engine->neonColor());
++  b.resetClip();
++}
++
++void drawBattery(Band& b, int x, int y) {
++  int p = batteryPercent();
++  KDColor c = p > 40 ? rgb(0x3BFF7A) : (p > 15 ? rgb(0xFFB020) : rgb(0xFF3050));
++  frame(b, {x, y, 18, 10}, rgb(0xFFFFFF));
++  fill(b, {x + 18, y + 3, 2, 4}, rgb(0xFFFFFF));
++  fill(b, {x + 2, y + 2, 14 * p / 100 + 1, 6}, c);
++}
++
++void drawHud(Band& b) {
++  KDColor neon = s_engine->neonColor();
++  // Theme
++  const char* name = k_themeNames[static_cast<int>(s.theme)];
++  int w = textWidth(name) + 22;
++  roundFill(b, {4, 4, w, 16}, 8, rgb(0x000000), 130);
++  disc(b, 12, 12, 3, neon);
++  text(b, name, 19, 5, rgb(0xFFFFFF));
++  // Coins and battery
++  char coins[16];
++  int n = coinCount();
++  int l = 0;
++  coins[l++] = '\xCF';
++  coins[l++] = '\x80';
++  coins[l++] = ' ';
++  if (n >= 10) {
++    coins[l++] = '0' + n / 10;
++  }
++  coins[l++] = '0' + n % 10;
++  coins[l++] = '/';
++  coins[l++] = '0' + s_numberOfCoins / 10;
++  coins[l++] = '0' + s_numberOfCoins % 10;
++  coins[l] = 0;
++  int cw = textWidth(coins) + 40;
++  roundFill(b, {k_screenWidth - 4 - cw, 4, cw, 16}, 8, rgb(0x000000), 130);
++  text(b, coins, k_screenWidth - 30, 5, rgb(0xFFD23F), Small, Align::Right);
++  drawBattery(b, k_screenWidth - 26, 7);
++  drawCompass(b);
++  // Crosshair and what you are looking at
++  bool openable;
++  const char* label = targetLabel(s_engine->target(), &openable);
++  int cx = k_screenWidth / 2, cy = k_screenHeight / 2;
++  KDColor cross = label ? neon : rgb(0xFFFFFF);
++  int arm = label ? 5 : 3;
++  fill(b, {cx - arm, cy, 2 * arm + 1, 1}, cross, 220);
++  fill(b, {cx, cy - arm, 1, 2 * arm + 1}, cross, 220);
++  if (label) {
++    int tw = textWidth(label) + (openable ? 34 : 16);
++    Rect r = {cx - tw / 2, 150, tw, 22};
++    roundFill(b, r, 11, rgb(0x0A0614), 200);
++    roundFrame(b, r, 11, neon);
++    int tx = r.x + 8;
++    if (openable) {
++      roundFill(b, {tx, r.y + 4, 22, 14}, 4, neon);
++      text(b, "OK", tx + 11, r.y + 4, rgb(0x0A0614), Small, Align::Center);
++      tx += 26;
++    }
++    text(b, label, tx, r.y + 4, rgb(0xFFFFFF));
++  }
++  // Turbo speed lines
++  if (s.speed > 3.4f) {
++    for (int i = 0; i < 10; i++) {
++      uint32_t h = hash(i * 31 + s.now / 50);
++      int y = static_cast<int>(h % k_screenHeight);
++      int len = 20 + static_cast<int>((h >> 8) % 40);
++      int x = (h >> 16) & 1 ? 0 : k_screenWidth - len;
++      fill(b, {x, y, len, 1}, rgb(0xFFFFFF), 150);
++    }
++    outlinedText(b, "TURBO", cx, 24, rgb(0xFFD23F), Small, Align::Center);
++  }
++  drawBip(b);
++  drawBubble(b);
++}
++
++void drawTeleport(Band& b) {
++  KDColor neon = s_engine->neonColor();
++  Rect panel = {26, 22, 268, 196};
++  roundFill(b, panel, 12, rgb(0x0A0614), 225);
++  roundFrame(b, panel, 12, neon);
++  text(b, "T\xC3\x89L\xC3\x89PORTEUR", k_screenWidth / 2, 28, neon, Large,
++       Align::Center);
++  fill(b, {panel.x + 12, 50, panel.w - 24, 1}, neon, 120);
++  int count = entryCount();
++  for (int r = 0; r < k_menuRows; r++) {
++    int i = s.menuScroll + r;
++    if (i >= count) {
++      break;
++    }
++    Entry e = entryAt(i);
++    int y = 56 + r * 18;
++    if (i == s.menuSelected) {
++      roundFill(b, {panel.x + 8, y - 1, panel.w - 22, 18}, 6, neon, 90);
++      roundFrame(b, {panel.x + 8, y - 1, panel.w - 22, 18}, 6, neon);
++    }
++    const char* tag = e.kind == Entry::Place ? "LIEU"
++                                             : (e.kind == Entry::App ? "APP" : "JEU");
++    KDColor tc = e.kind == Entry::Place
++                     ? rgb(0x22E6FF)
++                     : (e.kind == Entry::App ? rgb(0xFF3CAC) : rgb(0xFFD23F));
++    roundFill(b, {panel.x + 14, y + 2, 34, 12}, 4, tc, 220);
++    text(b, tag, panel.x + 31, y + 1, rgb(0x0A0614), Small, Align::Center);
++    text(b, entryLabel(e), panel.x + 56, y + 1, rgb(0xFFFFFF), Small,
++         Align::Left, panel.w - 70);
++  }
++  // Scroll bar
++  if (count > k_menuRows) {
++    int h = 144 * k_menuRows / count;
++    int y = 56 + (144 - h) * s.menuScroll / (count - k_menuRows);
++    fill(b, {panel.right() - 8, y, 3, h}, neon, 180);
++  }
++  text(b, "OK aller   Retour fermer", k_screenWidth / 2, 200,
++       rgb(0x9A9AB0), Small, Align::Center);
++}
++
++void drawMap(Band& b) {
++  KDColor neon = s_engine->neonColor();
++  constexpr int C = 8;
++  constexpr int mx = (k_screenWidth - k_mapWidth * C) / 2, my = 46;
++  roundFill(b, {mx - 10, 22, k_mapWidth * C + 20, k_mapHeight * C + 40}, 12,
++            rgb(0x0A0614), 225);
++  roundFrame(b, {mx - 10, 22, k_mapWidth * C + 20, k_mapHeight * C + 40}, 12,
++             neon);
++  int known = 0, total = 0;
++  for (int y = 0; y < k_mapHeight; y++) {
++    for (int x = 0; x < k_mapWidth; x++) {
++      char c = s_engine->cell(x, y);
++      bool seen = s.visited[y] & (1u << x);
++      if (Engine::isFloor(c)) {
++        total++;
++        known += seen ? 1 : 0;
++      }
++      if (!seen) {
++        continue;
++      }
++      Rect r = {mx + x * C, my + y * C, C, C};
++      if (Engine::isFloor(c)) {
++        fill(b, r, neon, 45);
++      } else if (c >= 'a' && c <= 'n') {
++        fill(b, {r.x + 1, r.y + 1, C - 2, C - 2}, rgb(0xFF3CAC));
++      } else if (c >= 'A' && c <= 'H') {
++        fill(b, {r.x + 1, r.y + 1, C - 2, C - 2}, rgb(0xFFD23F));
++      } else if (c == '=') {
++        fill(b, r, rgb(0xFF3050));
++      } else if (c == 'M' || c == 'T') {
++        fill(b, {r.x + 1, r.y + 1, C - 2, C - 2}, rgb(0xFFFFFF));
++      } else {
++        fill(b, r, rgb(0x5A5A78));
++      }
++    }
++  }
++  // Coins
++  for (int i = 0; i < s_numberOfCoins; i++) {
++    if (!(s.coins & (1 << i)) && (s.visited[s_coinY[i]] & (1u << s_coinX[i])) &&
++        ((s.now / 300) & 1)) {
++      disc(b, mx + s_coinX[i] * C + 4, my + s_coinY[i] * C + 4, 2,
++           rgb(0xFFD23F));
++    }
++  }
++  // Ghost
++  int gx = static_cast<int>(s.ghostX), gy = static_cast<int>(s.ghostY);
++  if ((s.visited[gy] & (1u << gx)) && ((s.now / 200) & 1)) {
++    disc(b, mx + static_cast<int>(s.ghostX * C), my + static_cast<int>(s.ghostY * C),
++         3, rgb(0xC9A0FF));
++  }
++  // Player
++  int px = mx + static_cast<int>(s.cam.x * C);
++  int py = my + static_cast<int>(s.cam.y * C);
++  for (int k = 0; k < 7; k++) {
++    fill(b, {px + static_cast<int>(cosf(s.cam.angle) * k),
++             py + static_cast<int>(sinf(s.cam.angle) * k), 1, 1},
++         rgb(0xFFFFFF));
++  }
++  disc(b, px, py, 2, rgb(0xFFFFFF));
++  // Title
++  char title[32];
++  strlcpy(title, "CARTE  -  explor\xC3\xA9""e ", sizeof(title));
++  int pct = total ? known * 100 / total : 0;
++  size_t l = strlen(title);
++  if (pct >= 100) {
++    title[l++] = '1';
++  }
++  if (pct >= 10) {
++    title[l++] = '0' + (pct / 10) % 10;
++  }
++  title[l++] = '0' + pct % 10;
++  title[l++] = '%';
++  title[l] = 0;
++  text(b, title, k_screenWidth / 2, 27, rgb(0xFFFFFF), Small, Align::Center);
++  text(b, "portails  bornes  porte  \xCF\x80", k_screenWidth / 2,
++       my + k_mapHeight * C + 2, rgb(0x9A9AB0), Small, Align::Center);
++}
++
++void renderCredits(Band& b) {
++  uint32_t e = s.now - s.modeStart;
++  const Rect& a = b.area();
++  for (int y = a.y; y < a.bottom(); y++) {
++    fill(b, {0, y, k_screenWidth, 1}, mix(rgb(0x14002A), rgb(0x000000), y));
++    for (int k = 0; k < 3; k++) {
++      uint32_t h = hash(y * 3 + k);
++      if ((h & 7) == 0) {
++        int x = static_cast<int>((h >> 8) % k_screenWidth -
++                                 (e / (20 + (h & 31))) % k_screenWidth);
++        x = (x + 2 * k_screenWidth) % k_screenWidth;
++        fill(b, {x, y, 1, 1}, rgb(0xFFFFFF), 120 + (h >> 24) % 120);
++      }
++    }
++  }
++  constexpr const char* k_credits[] = {
++      "#NUMVERSE",
++      "",
++      "#R\xC3\xA9""alis\xC3\xA9 par",
++      "une IA qui ne dort jamais",
++      "pendant que tu dormais",
++      "",
++      "#Moteur 3D",
++      "un raycaster fait main",
++      "320 rayons par image",
++      "",
++      "#R\xC3\xB4le principal",
++      "BIP",
++      "",
++      "#Le m\xC3\xA9""chant",
++      "le Glitch",
++      "",
++      "#Remerciements",
++      "\xCF\x80 (3,14159265...)",
++      "ton prof de maths",
++      "toi, pour les 10 \xCF\x80",
++      "",
++      "#R\xC3\xA9""alit\xC3\xA9 d\xC3\xA9""bloqu\xC3\xA9""e",
++      "ARC-EN-CIEL : touche 6",
++      "",
++      "",
++      "#FIN ?",
++  };
++  int count = sizeof(k_credits) / sizeof(k_credits[0]);
++  int base = k_screenHeight - static_cast<int>(e / 28);
++  for (int i = 0; i < count; i++) {
++    int y = base + i * 22;
++    if (y < -24 || y > k_screenHeight) {
++      continue;
++    }
++    const char* line = k_credits[i];
++    if (line[0] == '#') {
++      text(b, line + 1, k_screenWidth / 2, y,
++           hsv(i * 30 + static_cast<int>(e / 10), 160, 255), Large,
++           Align::Center);
++    } else {
++      text(b, line, k_screenWidth / 2, y + 2, rgb(0xE8E0FF), Small,
++           Align::Center);
++    }
++  }
++}
++
++void glitchBand(Band& b) {
++  const Rect& a = b.area();
++  for (int y = a.y; y < a.bottom(); y++) {
++    uint32_t h = hash(y * 7 + s.now / 45);
++    KDColor* row = b.row(y);
++    if ((h & 3) == 0) {
++      int off = static_cast<int>((h >> 4) % 50) - 25;
++      KDColor tmp[k_screenWidth];
++      for (int x = 0; x < k_screenWidth; x++) {
++        int sx = x + off;
++        sx = sx < 0 ? sx + k_screenWidth : (sx >= k_screenWidth ? sx - k_screenWidth : sx);
++        tmp[x] = row[sx];
++      }
++      memcpy(row, tmp, sizeof(tmp));
++    }
++    if ((h & 15) == 1) {
++      for (int x = 0; x < k_screenWidth; x++) {
++        KDColor c = row[x];
++        row[x] = KDColor::RGB888(c.blue(), 255 - c.red(), c.green());
++      }
++    }
++  }
++  if ((s.now / 100) & 1) {
++    outlinedText(b, "R\xC3\x89""ALIT\xC3\x89 CORROMPUE", k_screenWidth / 2, 60,
++                 rgb(0xFF3050), Large, Align::Center);
++  }
++}
++
++
++/* ======================================================= photo session */
++
++#if !PLATFORM_DEVICE
++const char* s_shotDir = nullptr;
++uint16_t s_shot[k_screenWidth * k_screenHeight];
++int s_gifFrame = 0;
++
++void shoot(const char* name) {
++  Band band;
++  for (int y = 0; y < k_screenHeight; y += Band::k_maxHeight) {
++    Rect area = {0, y, k_screenWidth, Band::k_maxHeight};
++    band.begin(area);
++    Shell::render(band);
++    memcpy(s_shot + y * k_screenWidth, band.pixels(),
++           sizeof(KDColor) * k_screenWidth * Band::k_maxHeight);
++  }
++  char path[512];
++  snprintf(path, sizeof(path), "%s/%s.raw", s_shotDir, name);
++  FILE* f = fopen(path, "wb");
++  if (f) {
++    fwrite(s_shot, 2, k_screenWidth * k_screenHeight, f);
++    fclose(f);
++  }
++}
++
++void gifFrame(const char* prefix) {
++  char name[64];
++  snprintf(name, sizeof(name), "%s_%04d", prefix, s_gifFrame++);
++  shoot(name);
++}
++
++uint64_t keyBit(Key k) { return 1ull << static_cast<int>(k); }
++
++void step(int ms, const char* gif) {
++  for (int t = 0; t < ms; t += 50) {
++    s_fakeClock += 50;
++    Shell::frame();
++    if (gif) {
++      gifFrame(gif);
++    }
++  }
++}
++
++void hold(uint64_t keys, int ms, const char* gif) {
++  s_fakeKeys = keys;
++  step(ms, gif);
++  s_fakeKeys = 0;
++}
++
++void press(Event e, int ms, const char* gif) {
++  Shell::handleEvent(e);
++  step(ms, gif);
++}
++
++void quiet() {
++  s.message.text = nullptr;
++  s.queueLength = 0;
++  for (Particle& p : s.particles) {
++    p.life = 0;
++  }
++  s.partyUntil = s.glitchUntil = s.flashUntil = 0;
++}
++
++void talk(const char* text, Mood mood) {
++  quiet();
++  showMessage({text, mood, 1});
++  s.messageStart = s.now - 3000;
++  s.messageEnd = s.now + 100000;
++}
++
++void still(const char* name, Theme theme, float x, float y, float angle,
++           const char* line, Mood mood) {
++  quiet();
++  s.mode = Mode::World;
++  if (s.theme != theme) {
++    setTheme(theme, false);
++  }
++  quiet();
++  placeAt(x, y, angle);
++  s.lastInput = s.now;
++  step(100, nullptr);
++  if (line) {
++    talk(line, mood);
++  }
++  step(50, nullptr);
++  shoot(name);
++}
++
++void photoSession() {
++  s_fake = true;
++  s_fakeClock = 100000;
++  s.now = s.last = s_fakeClock;
++  // Boot
++  s.mode = Mode::Boot;
++  s.modeStart = s_fakeClock;
++  constexpr int k_bootStills[] = {200, 380, 1500, 3300, 3700, 5200};
++  for (int t : k_bootStills) {
++    s.now = s_fakeClock + t;
++    char name[32];
++    snprintf(name, sizeof(name), "boot_%d", t);
++    shoot(name);
++  }
++  s_gifFrame = 0;
++  for (int t = 0; t < 6000; t += 60) {
++    s.now = s_fakeClock + t;
++    gifFrame("gifboot");
++  }
++  // Navigation GIF: arrival, walking, realities, party, teleporter
++  s_fakeClock += 6100;
++  s.now = s.last = s_fakeClock;
++  startWorld(true);
++  s_gifFrame = 0;
++  const char* g = "gifnav";
++  step(1700, g);
++  hold(keyBit(Key::Up), 800, g);
++  hold(keyBit(Key::Left), 650, g);
++  hold(keyBit(Key::Up), 450, g);
++  step(500, g);
++  press(Events::Two, 1100, g);
++  hold(keyBit(Key::Right), 900, g);
++  press(Events::Three, 1000, g);
++  hold(keyBit(Key::Up) | keyBit(Key::Right), 700, g);
++  press(Events::Four, 1100, g);
++  hold(keyBit(Key::Left), 600, g);
++  press(Events::Five, 1100, g);
++  press(Events::One, 500, g);
++  press(Events::Pi, 1300, g);
++  press(Events::Back, 500, g);
++  press(Events::Down, 250, g);
++  press(Events::Down, 250, g);
++  press(Events::Down, 250, g);
++  press(Events::Down, 400, g);
++  s.mode = Mode::Warp;
++  s.warpLabel = "Grapheur";
++  s.warpStart = s_fakeClock;
++  for (int t = 0; t < 750; t += 50) {
++    s_fakeClock += 50;
++    s.now = s_fakeClock;
++    gifFrame(g);
++  }
++  s.mode = Mode::World;
++  s.launches = 1;
++
++  // Stills
++  s.seenPortals = 0xFFFF;
++  still("hall", Theme::Synthwave, 1.6f, 6.4f, -0.42f, k_intro[0], Mood::Happy);
++  still("portail", Theme::Synthwave, 4.5f, 2.75f, -1.5708f,
++        k_appInfos[1].line, Mood::Happy);
++  still("liminal", Theme::Liminal, 10.6f, 8.6f, 3.65f, k_themeLines[1],
++        Mood::Scared);
++  still("matrix", Theme::Matrix, 1.5f, 8.6f, -0.55f, k_themeLines[2],
++        Mood::Happy);
++  still("abysse", Theme::Abyss, 19.5f, 8.3f, -1.5708f, k_themeLines[3],
++        Mood::Happy);
++  step(400, nullptr);
++  shoot("abysse");
++  still("cahier", Theme::Paper, 6.5f, 8.7f, -1.5708f, k_themeLines[4],
++        Mood::Happy);
++  still("arcade", Theme::Synthwave, 21.6f, 8.5f, -2.3f,
++        "Borne vide. Ajoute des jeux\n.nwa avec l'installateur !", Mood::Bored);
++  // The Glitch in the maze
++  s.ghostX = 19.0f;
++  s.ghostY = 11.5f;
++  s.ghostTX = 19;
++  s.ghostTY = 11;
++  s.ghostPX = 19;
++  s.ghostPY = 11;
++  quiet();
++  placeAt(15.5f, 15.5f, -0.35f);
++  s_fakeKeys = 0;
++  {
++    Sprite sprites[2] = {
++        {16.5f, 14.6f, 0.52f, 0.8f, SpriteKind::Ghost, 0},
++        {16.4f, 15.5f, 0.34f, 0.36f, SpriteKind::Coin, 0},
++    };
++    s_engine->prepare(s.cam, s.now, sprites, 2);
++    talk("C'est le Glitch.\nNe le touche SURTOUT pas.", Mood::Scared);
++    shoot("glitch");
++    s.glitchUntil = s.now + 500;
++    shoot("corrompu");
++    s.glitchUntil = 0;
++  }
++  // Teleporter and map
++  for (uint32_t& row : s.visited) {
++    row = 0xFFFFFF;
++  }
++  still("teleporteur", Theme::Synthwave, 3.5f, 5.5f, 0.f, nullptr, Mood::Happy);
++  s.mode = Mode::Teleport;
++  s.menuSelected = 5;
++  s.menuScroll = 0;
++  shoot("teleporteur");
++  s.mode = Mode::Map;
++  step(300, nullptr);
++  shoot("carte");
++  // Secret room
++  s.coins = (1u << s_numberOfCoins) - 1;
++  s_engine->setDoorOpen(true);
++  s.rainbowUnlocked = true;
++  still("secret", Theme::Rainbow, 5.4f, 16.3f, 3.35f,
++        "TOUT EST ARC-EN-CIEL.\nJe n'ai aucun regret.", Mood::Love);
++  // Credits and warp
++  s.mode = Mode::Credits;
++  s.modeStart = s.now - 5200;
++  shoot("credits");
++  s.mode = Mode::Warp;
++  s.warpLabel = "Grapheur";
++  s.warpStart = s.now - 300;
++  shoot("saut");
++  // Party
++  s.mode = Mode::World;
++  quiet();
++  setTheme(Theme::Synthwave, false);
++  placeAt(9.4f, 3.2f, 2.6f);
++  s.partyUntil = s.now + 5000;
++  for (int i = 0; i < 30; i++) {
++    step(50, nullptr);
++  }
++  showMessage({"\xCF\x80 ! \xCF\x80 ! \xCF\x80 !\n3,14159265358979...", Mood::Wow, 1});
++  s.messageStart = s.now - 3000;
++  s.messageEnd = s.now + 100000;
++  shoot("fete");
++
++  // Smoke test: every key in every mode, walking everywhere
++  constexpr Event k_keys[] = {
++      Events::Up,      Events::Down,  Events::Left, Events::Right,
++      Events::OK,      Events::EXE,   Events::Back, Events::Toolbox,
++      Events::Var,     Events::Ans,   Events::Pi,   Events::One,
++      Events::Two,     Events::Three, Events::Four, Events::Five,
++      Events::Six,     Events::Home,  Events::Zero, Events::Backspace};
++  constexpr int k_numberOfKeys = sizeof(k_keys) / sizeof(k_keys[0]);
++  s.coins = 0;
++  s_engine->setDoorOpen(false);
++  int events = 0;
++  for (int round = 0; round < 4000; round++) {
++    Event e = k_keys[rnd() % k_numberOfKeys];
++    if (e == Events::OK && s.mode == Mode::World) {
++      // Never open an app here: only the safe targets
++      char c = s_engine->target().cell;
++      if ((c >= 'a' && c <= 'n') || (c >= 'A' && c <= 'H')) {
++        e = Events::Up;
++      }
++    }
++    if (e == Events::OK && s.mode == Mode::Teleport &&
++        entryAt(s.menuSelected).kind != Entry::Place) {
++      e = Events::Down;
++    }
++    Shell::handleEvent(e);
++    events++;
++    s_launch = k_noItem;
++    s_fakeKeys = (rnd() & 1) ? keyBit(Key::Up) : keyBit(Key::Left);
++    step(50 + (rnd() % 4) * 50, nullptr);
++    if ((round % 500) == 0) {
++      // Grab some coins and open the door on the way
++      s.coins |= 1u << (round / 500);
++    }
++  }
++  s_fakeKeys = 0;
++  // The door, the monolith and the trophy
++  s.coins = (1u << s_numberOfCoins) - 1;
++  s_engine->setDoorOpen(true);
++  s.mode = Mode::World;
++  placeAt(4.5f, 5.5f, 0.f);
++  step(50, nullptr);
++  Shell::handleEvent(Events::OK);
++  placeAt(4.5f, 15.5f, 3.1416f);
++  step(50, nullptr);
++  Shell::handleEvent(Events::OK);
++  step(2000, nullptr);
++  Shell::handleEvent(Events::OK);
++  step(500, nullptr);
++  printf("NUMVERSE smoke test: %d events, mode %d, coins %d, pos %.2f %.2f\n",
++         events, static_cast<int>(s.mode), coinCount(), s.cam.x, s.cam.y);
++}
++#endif
++}  // namespace
++
++/* =============================================================== shell */
++
++namespace Shell {
++
++void attach(Engine* engine) {
++  s_engine = engine;
++  s_launch = k_noItem;
++  s.now = s.last = clockMs();
++  buildItems();
++  bool first = !s.initialized;
++  if (first) {
++    s.initialized = true;
++    s.random = 0x9E3779B9u ^ Ion::random();
++    if (s.random == 0) {
++      s.random = 1;
++    }
++    s.theme = Theme::Synthwave;
++    s.hud = true;
++    placeAt(3.5f, 5.5f, 0.f);
++    resetGhost();
++    s.mode = Mode::Boot;
++    s.modeStart = s.now;
++    s.lastInput = s.now;
++  }
++  setupEngine();
++  s_engine->setWave(s.theme == Theme::Abyss);
++  if (!first) {
++    if (s.mode != Mode::Boot) {
++      s.mode = Mode::World;
++    }
++    s.lastInput = s.now;
++    s.worldStart = s.now;
++    s.queueLength = 0;
++    s.message.text = nullptr;
++    if (s.launches > 0) {
++      say(k_back[rnd() % (sizeof(k_back) / sizeof(k_back[0]))], Mood::Happy, 1);
++    }
++  }
++  frame();
++#if !PLATFORM_DEVICE
++  const char* shots = getenv("NUMVERSE_SHOTS");
++  if (shots && first) {
++    s_shotDir = shots;
++    photoSession();
++    exit(0);
++  }
++#endif
++}
++
++void detach() { s_engine = nullptr; }
++
++void setLastRedrawDuration(int ms) {
++  if (!s_engine || s.mode == Mode::Boot || s.mode == Mode::Credits) {
++    return;
++  }
++  // Smoothed frame time, in ms * 4
++  s.redrawAverage = (s.redrawAverage * 3 + ms * 4) / 4;
++  if (!s_engine->lowResolution() && s.redrawAverage > 60 * 4) {
++    s_engine->setLowResolution(true);
++  } else if (s_engine->lowResolution() && s.redrawAverage < 22 * 4) {
++    s_engine->setLowResolution(false);
++  }
++}
++
++void leave() {}
++
++Item takeLaunch() {
++  Item it = s_launch;
++  s_launch = k_noItem;
++  return it;
++}
++
++int framePeriod() {
++  if (s.mode == Mode::World && s.now - s.lastInput > 40000 &&
++      s.now > s.partyUntil) {
++    return 160;  // BIP sleeps: save the battery
++  }
++  return 30;
++}
++
++bool handleEvent(Event e) {
++  if (!s_engine) {
++    return false;
++  }
++  if (!e.isKeyboardEvent() || e == Events::OnOff) {
++    return false;
++  }
++  if (e == Events::Shift || e == Events::Alpha || e == Events::AlphaCaps) {
++    return false;
++  }
++  s.now = clockMs();
++  s.lastInput = s.now;
++  Ion::Keyboard::State keys = scanKeys();
++  switch (s.mode) {
++    case Mode::Boot:
++      startWorld(true);
++      return true;
++    case Mode::Credits:
++      if (e == Events::OK || e == Events::Back || e == Events::EXE ||
++          e == Events::Home) {
++        s.mode = Mode::World;
++        say("ARC-EN-CIEL d\xC3\xA9""bloqu\xC3\xA9 !\nAppuie sur 6. Vas-y.",
++            Mood::Love, 3);
++      }
++      return true;
++    case Mode::Map:
++      if (e == Events::Toolbox || e == Events::Back || e == Events::OK ||
++          e == Events::Home) {
++        s.mode = Mode::World;
++      }
++      return true;
++    case Mode::Teleport: {
++      int count = entryCount();
++      if (e == Events::Up || e == Events::Down) {
++        int d = e == Events::Up ? -1 : 1;
++        s.menuSelected = (s.menuSelected + d + count) % count;
++        if (s.menuSelected < s.menuScroll) {
++          s.menuScroll = s.menuSelected;
++        } else if (s.menuSelected >= s.menuScroll + k_menuRows) {
++          s.menuScroll = s.menuSelected - k_menuRows + 1;
++        }
++      } else if (e == Events::OK || e == Events::EXE) {
++        activateEntry(entryAt(s.menuSelected));
++      } else if (e == Events::Back || e == Events::Home) {
++        s.mode = Mode::World;
++      }
++      return true;
++    }
++    default:
++      break;
++  }
++  // World
++  if (e == Events::Up || e == Events::Down) {
++    Key k = e == Events::Up ? Key::Up : Key::Down;
++    if (!keys.keyDown(k)) {
++      // The key is already up (replayed events): one step
++      float d = e == Events::Up ? 0.45f : -0.3f;
++      if (!tryMove(cosf(s.cam.angle) * d, sinf(s.cam.angle) * d)) {
++        say(k_bump[rnd() % (sizeof(k_bump) / sizeof(k_bump[0]))],
++            Mood::Angry, 1);
++      }
++    }
++    return true;
++  }
++  if (e == Events::Left || e == Events::Right) {
++    Key k = e == Events::Left ? Key::Left : Key::Right;
++    if (!keys.keyDown(k)) {
++      s.cam.angle += e == Events::Left ? -0.3f : 0.3f;
++    }
++    return true;
++  }
++  if (e == Events::OK) {
++    interact();
++    return true;
++  }
++  if (e == Events::EXE) {
++    if (s.cam.z <= 0.55f) {
++      s.vz = 2.3f;
++      if ((rnd() % 4) == 0) {
++        say("Wouhou !", Mood::Wow, 1);
++      }
++    }
++    return true;
++  }
++  if (e == Events::Back || e == Events::Home) {
++    s.mode = Mode::Teleport;
++    s.menuSelected = 0;
++    s.menuScroll = 0;
++    return true;
++  }
++  if (e == Events::Toolbox) {
++    s.mode = Mode::Map;
++    return true;
++  }
++  if (e == Events::Var) {
++    s.hud = !s.hud;
++    return true;
++  }
++  if (e == Events::Ans) {
++    say(k_jokes[s.jokeIndex % (sizeof(k_jokes) / sizeof(k_jokes[0]))],
++        Mood::Happy, 2);
++    s.jokeIndex++;
++    return true;
++  }
++  if (e == Events::Pi) {
++    s.partyUntil = s.now + 5000;
++    burst(k_screenWidth / 2, k_screenHeight / 2, 30);
++    say("\xCF\x80 ! \xCF\x80 ! \xCF\x80 !\n3,14159265358979...", Mood::Wow, 2);
++    return true;
++  }
++  constexpr Event k_themeKeys[] = {Events::One, Events::Two, Events::Three,
++                                   Events::Four, Events::Five, Events::Six};
++  for (int i = 0; i < k_numberOfThemes; i++) {
++    if (e == k_themeKeys[i]) {
++      if (static_cast<int>(s.theme) != i) {
++        setTheme(static_cast<Theme>(i), true);
++      }
++      return true;
++    }
++  }
++  return true;
++}
++
++bool frame() {
++  if (!s_engine) {
++    return false;
++  }
++  s.now = clockMs();
++  float dt = (s.now - s.last) / 1000.f;
++  if (dt > 0.1f) {
++    dt = 0.1f;
++  }
++  s.last = s.now;
++  updateMessages();
++  if (s.mode == Mode::Boot) {
++    if (s.now - s.modeStart > 7000) {
++      startWorld(true);
++    }
++    return true;
++  }
++  if (s.mode == Mode::World) {
++    updateWorld(dt, scanKeys());
++  } else if (s.mode != Mode::Credits) {
++    updateGhost(dt);
++  }
++  if (s.mode == Mode::World && s.now - s.worldStart < 1600 && s.launches == 0) {
++    // Intro: one full turn on arrival
++    float t = (s.now - s.worldStart) / 1600.f;
++    float ease = 1.f - (1.f - t) * (1.f - t) * (1.f - t);
++    s.cam.angle = (1.f - ease) * -2.f * k_pi;
++    if (s.cam.angle < 0) {
++      s.cam.angle += 2 * k_pi;
++    }
++  }
++  updateParticles();
++  if (s.mode != Mode::Credits) {
++    // Sprites: coins and the Glitch
++    Sprite sprites[k_maxCoins + 1];
++    int n = 0;
++    for (int i = 0; i < s_numberOfCoins; i++) {
++      if (!(s.coins & (1 << i))) {
++        sprites[n++] = {s_coinX[i] + 0.5f, s_coinY[i] + 0.5f,
++                        0.32f + 0.05f * sinf(s.now * 0.003f + i), 0.36f,
++                        SpriteKind::Coin, static_cast<uint8_t>(i)};
++      }
++    }
++    sprites[n++] = {s.ghostX, s.ghostY,
++                    0.5f + 0.06f * sinf(s.now * 0.004f), 0.8f,
++                    SpriteKind::Ghost, 0};
++    s_engine->prepare(s.cam, s.now, sprites, n);
++  }
++  return true;
++}
++
++void render(Band& b) {
++  if (!s_engine) {
++    fill(b, b.area(), rgb(0x000000));
++    return;
++  }
++  switch (s.mode) {
++    case Mode::Boot:
++      renderBoot(b);
++      return;
++    case Mode::Credits:
++      renderCredits(b);
++      return;
++    case Mode::Warp:
++      renderWarp(b);
++      return;
++    default:
++      break;
++  }
++  s_engine->render(b);
++  renderParticles(b);
++  if (s.now < s.glitchUntil) {
++    glitchBand(b);
++  }
++  if (s.mode == Mode::World && s.hud) {
++    drawHud(b);
++  } else if (s.mode == Mode::World && !s.hud) {
++    // Photo mode: only a discreet badge
++    text(b, "MODE PHOTO  (var)", k_screenWidth - 6, k_screenHeight - 16,
++         rgb(0xFFFFFF), Small, Align::Right, k_screenWidth, 140);
++  }
++  if (s.mode == Mode::Teleport) {
++    drawTeleport(b);
++  } else if (s.mode == Mode::Map) {
++    drawMap(b);
++  }
++  if (s.now < s.flashUntil) {
++    fill(b, b.area(), rgb(0xFFFFFF), static_cast<int>(s.flashUntil - s.now));
++  }
++}
++
++}  // namespace Shell
++
++}  // namespace Verse
++}  // namespace Home
+diff --git a/epsilon/apps/home/verse/shell.h b/epsilon/apps/home/verse/shell.h
+new file mode 100644
+index 0000000000..40d343ca25
+--- /dev/null
++++ b/epsilon/apps/home/verse/shell.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include <ion/events.h>
++
++#include "engine.h"
++#include "gfx.h"
++
++namespace Home {
++namespace Verse {
++
++// Something to start: a calculator app or an external app (.nwa game)
++struct Item {
++  enum class Kind : uint8_t { None, Builtin, External };
++  Kind kind;
++  int16_t index;  // app index in AppsContainer, or external app index
++  bool isNone() const { return kind == Kind::None; }
++};
++
++constexpr Item k_noItem = {Item::Kind::None, 0};
++
++/* The NUMVERSE world. Its state is static: it survives leaving the home app
++ * to run a calculator app or a game. The engine (textures, buffers) lives in
++ * the home app itself, which is only in RAM while the world is shown. */
++namespace Shell {
++
++void attach(Engine* engine);
++void detach();
++void leave();
++// Returns true if the event was used
++bool handleEvent(Ion::Events::Event event);
++// One animation step. Returns true to redraw the screen.
++bool frame();
++// Animation period in ms
++int framePeriod();
++void render(Band& band);
++// Time taken by the last full redraw (adapts the resolution)
++void setLastRedrawDuration(int ms);
++// The app to open, set by handleEvent; the caller opens it right away
++Item takeLaunch();
++
++}  // namespace Shell
++
++}  // namespace Verse
++}  // namespace Home
+diff --git a/epsilon/escher/include/escher/app.h b/epsilon/escher/include/escher/app.h
+index 269ea7b590..8845dd2471 100644
+--- a/epsilon/escher/include/escher/app.h
++++ b/epsilon/escher/include/escher/app.h
+@@ -89,6 +89,9 @@ class App : public Responder {
+   virtual bool canStoreLayout() const { return false; }
+   virtual void storeLayout(const Poincare::Layout& layout = {}) {}
+   virtual int numberOfTimers() { return 0; }
++  // PSP-OS animations, see RunLoop. Return true to redraw the window.
++  virtual int animationPeriod() { return 0; }
++  virtual bool animationFrame() { return false; }
+   virtual Timer* timerAtIndex(int i) {
+     assert(false);
+     return nullptr;
+diff --git a/epsilon/escher/include/escher/container.h b/epsilon/escher/include/escher/container.h
+index 2a0cd8ce22..b7f005903d 100644
+--- a/epsilon/escher/include/escher/container.h
++++ b/epsilon/escher/include/escher/container.h
+@@ -37,6 +37,8 @@ class Container : public RunLoop {
+ 
+  private:
+   int numberOfTimers() override;
++  int animationPeriod() override;
++  void animationFrame() override;
+   Timer* timerAtIndex(int i) override;
+   virtual int numberOfContainerTimers();
+   virtual Timer* containerTimerAtIndex(int i);
+diff --git a/epsilon/escher/include/escher/run_loop.h b/epsilon/escher/include/escher/run_loop.h
+index 3c028526fe..40e32ba36b 100644
+--- a/epsilon/escher/include/escher/run_loop.h
++++ b/epsilon/escher/include/escher/run_loop.h
+@@ -16,6 +16,10 @@ class RunLoop {
+   virtual int numberOfTimers();
+   virtual Timer* timerAtIndex(int i);
+   virtual void listenToExternalEvents() = 0;
++  /* PSP-OS animations: when animationPeriod() > 0 (in ms), events are waited
++   * for at most that long and animationFrame() is called on every step. */
++  virtual int animationPeriod() { return 0; }
++  virtual void animationFrame() {}
+ 
+  private:
+   // Returns true while the Termination event is not fired.
+diff --git a/epsilon/escher/include/escher/theme/light_theme.h b/epsilon/escher/include/escher/theme/light_theme.h
+index 4d5f8cf5ec..e4246c442b 100644
+--- a/epsilon/escher/include/escher/theme/light_theme.h
++++ b/epsilon/escher/include/escher/theme/light_theme.h
+@@ -27,7 +27,7 @@ constexpr static ThemeContainer k_lightTheme =
+                    .InactiveTabSelected = Palette::SelectDark,
+                    .SurfaceSelect = Palette::Select,
+                    .SurfaceSelectApps = Palette::YellowDark,
+-                   .TitleBar = Palette::YellowDark,
++                   .TitleBar = KDSpecialColors::k_lightThemeMain,
+                    .BannerPurple = Palette::PurpleBright,
+                    .BannerElements = Palette::GrayWhite,
+                    .BannerGrayMiddle = Palette::GrayMiddle,
+@@ -60,7 +60,7 @@ constexpr static ThemeContainer k_lightTheme =
+                    .BorderPurple = Palette::PurpleBright,
+                    .BorderBoxTitleCell = Palette::PurpleDark,
+                    .BorderElementsBanner = Palette::GrayMiddle,
+-                   .SeparatorTitleBar = Palette::YellowDark,
++                   .SeparatorTitleBar = KDSpecialColors::k_lightThemeMain,
+                    .SeparatorTitleHeaders = Palette::Black,
+                    .ButtonLightBorderMain = Palette::GrayBright,
+                    .ButtonLightBorderBottom = Palette::GrayWhite,
+diff --git a/epsilon/escher/src/container.cpp b/epsilon/escher/src/container.cpp
+index a368cec4cc..0a9757b6de 100644
+--- a/epsilon/escher/src/container.cpp
++++ b/epsilon/escher/src/container.cpp
+@@ -44,6 +44,16 @@ bool Container::dispatchEvent(Ion::Events::Event event) {
+   return false;
+ }
+ 
++int Container::animationPeriod() {
++  return s_activeApp ? s_activeApp->animationPeriod() : 0;
++}
++
++void Container::animationFrame() {
++  if (s_activeApp && s_activeApp->animationFrame()) {
++    window()->redraw();
++  }
++}
++
+ void Container::run() {
+   window()->redraw();
+   RunLoop::run();
+diff --git a/epsilon/escher/src/run_loop.cpp b/epsilon/escher/src/run_loop.cpp
+index c20471d407..0b335f97e1 100644
+--- a/epsilon/escher/src/run_loop.cpp
++++ b/epsilon/escher/src/run_loop.cpp
+@@ -36,6 +36,10 @@ bool RunLoop::step() {
+ 
+   // Fetch the event, if any
+   int eventDuration = Timer::TickDuration;
++  int animation = animationPeriod();
++  if (animation > 0 && animation < eventDuration) {
++    eventDuration = animation;
++  }
+   int timeout = eventDuration;
+ 
+   Ion::Events::Event event = Ion::Events::getEvent(&timeout);
+@@ -85,6 +89,10 @@ bool RunLoop::step() {
+     dispatchEvent(event);
+   }
+ 
++  if (animation > 0 && event != Ion::Events::Termination) {
++    animationFrame();
++  }
++
+   return event != Ion::Events::Termination;
+ }
+ 
+diff --git a/shared/kandinsky/include/kandinsky/color.h b/shared/kandinsky/include/kandinsky/color.h
+index aa6dcf3fa1..53bbbbb180 100644
+--- a/shared/kandinsky/include/kandinsky/color.h
++++ b/shared/kandinsky/include/kandinsky/color.h
+@@ -82,7 +82,7 @@ constexpr KDColor KDWhite = KDColor::RGB24(0xFFFFFF);
+  * kernel. */
+ namespace KDSpecialColors {
+ // Theme (light / dark) signature colors (used for example in the title bar)
+-constexpr KDColor k_lightThemeMain = KDColor::RGB24(0xFFB734);
++constexpr KDColor k_lightThemeMain = KDColor::RGB24(0xC2187A);  // NUMVERSE neon magenta
+ constexpr KDColor k_darkThemeMain = KDColor::RGB24(0xC3CAF4);
+ // Theme (light / dark) neutral colors (black or white)
+ constexpr KDColor k_lightThemeNeutral = KDWhite;
